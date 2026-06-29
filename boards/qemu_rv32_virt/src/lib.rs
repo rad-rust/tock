@@ -35,17 +35,34 @@ pub type ProcessHw = kernel::process::ProcessStandard<
 >;
 
 use qemu_rv32_virt_chip::chip::{SyncEntry, CLINT_MSIP1, LOCKSTEP_CHAN};
+use qemu_rv32_virt_chip::lockstep::{DriverUpcallRules, UpcallMode, UpcallRule};
 
+// ---------------------------------------------------------------------------
+// Layer-2 upcall-verifier registry (compare-mode for console upcalls)
+// ---------------------------------------------------------------------------
+
+static CONSOLE_UPCALL_RULES: [UpcallRule; 2] = [
+    UpcallRule {
+        subscribe_num: 1, // subscribe_num 1 = WRITE_DONE in capsules_core::console
+        mode: UpcallMode::Compare,
+        mask: (true, false, false), // r0 = bytes written; r1/r2 unused
+    },
+    UpcallRule {
+        subscribe_num: 2, // subscribe_num 2 = READ_DONE
+        mode: UpcallMode::Compare,
+        mask: (true, false, false), // r0 = bytes read; r1/r2 unused
+    },
+];
+
+static UPCALL_REGISTRY: [DriverUpcallRules; 1] = [DriverUpcallRules {
+    driver_num: capsules_core::console::DRIVER_NUM,
+    rules: &CONSOLE_UPCALL_RULES,
+}];
 
 type ProcessPrinter = capsules_system::process_printer::ProcessPrinterText;
 
-type RngDriver = components::rng::RngRandomComponentType<
-    qemu_rv32_virt_chip::virtio::devices::virtio_rng::VirtIORng<
-        'static,
-        'static,
-        RiscvCoherentDmaFence,
-    >,
->;
+type RngDriver =
+    components::rng::RngRandomComponentType<qemu_rv32_virt_chip::rng::LockstepRng<'static>>;
 pub type ScreenHw = qemu_rv32_virt_chip::virtio::devices::virtio_gpu::VirtIOGPU<
     'static,
     'static,
@@ -311,9 +328,28 @@ pub unsafe fn start() -> (
     );
 
     // Create a shared UART channel for the console and for kernel
-    // debug over the provided memory-mapped 16550-compatible
-    // UART.
-    let uart_mux = components::console::UartMuxComponent::new(&peripherals.uart0, 115200)
+    // debug over the provided memory-mapped 16550-compatible UART.
+    // LockstepUart sits between uart0 and MuxUart: its hooks fire the
+    // cross-hart signals that previously lived inside Uart16550 itself.
+    let lockstep_uart: &'static qemu_rv32_virt_chip::lockstep::LockstepUart<
+        'static,
+        qemu_rv32_virt_chip::uart::Uart16550<'static>,
+        qemu_rv32_virt_chip::lockstep::QemuUartHooks,
+    > = {
+        use qemu_rv32_virt_chip::lockstep::{LockstepUart, QemuUartHooks};
+        use qemu_rv32_virt_chip::uart::Uart16550;
+        let uart_hooks: &'static QemuUartHooks =
+            static_init!(QemuUartHooks, QemuUartHooks::new());
+        let w: &'static LockstepUart<'static, Uart16550<'static>, QemuUartHooks> = static_init!(
+            LockstepUart<'static, Uart16550<'static>, QemuUartHooks>,
+            LockstepUart::new(&peripherals.uart0, uart_hooks),
+        );
+        // uart0 upward callbacks (TX-done, RX-done) go through the wrapper.
+        hil::uart::Transmit::set_transmit_client(&peripherals.uart0, w);
+        hil::uart::Receive::set_receive_client(&peripherals.uart0, w);
+        w
+    };
+    let uart_mux = components::console::UartMuxComponent::new(lockstep_uart, 115200)
         .finalize(components::uart_mux_component_static!());
 
     // Use the RISC-V machine timer timesource
@@ -762,11 +798,22 @@ pub unsafe fn start() -> (
     // ---------- RNG ----------
 
     // Userspace RNG driver over the VirtIO EntropySource
-    let rng_driver = virtio_rng.map(|rng| {
-        components::rng::RngRandomComponent::new(board_kernel, capsules_core::rng::DRIVER_NUM, rng)
-            .finalize(components::rng_random_component_static!(
-                qemu_rv32_virt_chip::virtio::devices::virtio_rng::VirtIORng<RiscvCoherentDmaFence>
-            ))
+    // Interpose LockstepRng between VirtIORng and RngDriver so hart 0 forwards
+    // each entropy batch to hart 1 via LOCKSTEP_CHAN.
+    let rng_driver = virtio_rng.map(|virtio_rng| {
+        use qemu_rv32_virt_chip::lockstep::QemuRngHooks;
+        use qemu_rv32_virt_chip::rng::LockstepRng;
+        let rng_hooks = static_init!(QemuRngHooks, QemuRngHooks::new());
+        let lockstep_rng = static_init!(
+            LockstepRng<'static>,
+            LockstepRng::new(Some(virtio_rng), Some(rng_hooks))
+        );
+        components::rng::RngRandomComponent::new(
+            board_kernel,
+            capsules_core::rng::DRIVER_NUM,
+            lockstep_rng,
+        )
+        .finalize(components::rng_random_component_static!(LockstepRng<'static>))
     });
 
     // ---------- SCHEDULER ----------
@@ -824,6 +871,13 @@ pub unsafe fn start() -> (
         debug!("- VirtIO Input device not found, disabling Input");
     }
 
+    // Register the Layer-2 upcall verifier before entering the kernel loop.
+    let upcall_verifier = static_init!(
+        qemu_rv32_virt_chip::lockstep::QemuUpcallVerifier,
+        qemu_rv32_virt_chip::lockstep::QemuUpcallVerifier::new(&UPCALL_REGISTRY),
+    );
+    board_kernel.register_upcall_verifier(upcall_verifier);
+
     (board_kernel, platform, chip, processes)
 }
 
@@ -874,6 +928,7 @@ pub struct Hart1Platform {
         'static,
         VirtualMuxAlarm<'static, qemu_rv32_virt_chip::chip::QemuRv32VirtClint<'static>>,
     >,
+    pub rng: &'static RngDriver,
 }
 
 impl kernel::platform::SyscallDriverLookup for Hart1Platform {
@@ -884,6 +939,7 @@ impl kernel::platform::SyscallDriverLookup for Hart1Platform {
         match driver_num {
             capsules_core::console::DRIVER_NUM => f(Some(self.console)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
+            capsules_core::rng::DRIVER_NUM => f(Some(self.rng)),
             _ => f(None),
         }
     }
@@ -1093,24 +1149,55 @@ pub unsafe fn start_secondary() -> (
 
     // Wire Hart 1's Console to the hardware-free replay stub.
     // Hart 0 owns the physical UART; Hart 1 receives data via MSIP replay.
+    // A LockstepUart wrapper sits between HART1_UART_BUF and Console so that
+    // the same hooks infrastructure is present on both harts (hooks are no-ops
+    // on hart 1, but the wrapper structure mirrors the hart-0 chain).
     let memory_alloc_cap = create_capability!(capabilities::MemoryAllocationCapability);
     let console = {
         use capsules_core::console::{Console, DEFAULT_BUF_SIZE};
-        use qemu_rv32_virt_chip::uart::HART1_UART_BUF;
+        use qemu_rv32_virt_chip::lockstep::{LockstepUart, QemuUartHooks};
+        use qemu_rv32_virt_chip::uart::{VirtualUartBuffer, HART1_UART_BUF};
         let tx_buf = static_init!([u8; DEFAULT_BUF_SIZE], [0; DEFAULT_BUF_SIZE]);
         let rx_buf = static_init!([u8; DEFAULT_BUF_SIZE], [0; DEFAULT_BUF_SIZE]);
+        let uart_hooks: &'static QemuUartHooks =
+            static_init!(QemuUartHooks, QemuUartHooks::new());
+        let lockstep_uart: &'static LockstepUart<'static, VirtualUartBuffer, QemuUartHooks> =
+            static_init!(
+                LockstepUart<'static, VirtualUartBuffer, QemuUartHooks>,
+                LockstepUart::new(&HART1_UART_BUF, uart_hooks),
+            );
+        hil::uart::Receive::set_receive_client(&HART1_UART_BUF, lockstep_uart);
+        hil::uart::Transmit::set_transmit_client(&HART1_UART_BUF, lockstep_uart);
         let console: &'static Console<'static> = static_init!(
             Console<'static>,
             Console::new(
-                &HART1_UART_BUF,
+                lockstep_uart,
                 tx_buf,
                 rx_buf,
                 board_kernel.create_grant(capsules_core::console::DRIVER_NUM, &memory_alloc_cap),
             )
         );
-        hil::uart::Receive::set_receive_client(&HART1_UART_BUF, console);
-        hil::uart::Transmit::set_transmit_client(&HART1_UART_BUF, console);
+        hil::uart::Receive::set_receive_client(lockstep_uart, console);
+        hil::uart::Transmit::set_transmit_client(lockstep_uart, console);
         console
+    };
+
+    // Wire Hart 1's RNG to the software replay stub.
+    // Grant must be created before load_processes() finalizes the grant count.
+    let rng_driver = {
+        use core::sync::atomic::Ordering;
+        use qemu_rv32_virt_chip::rng::{LockstepRng, HART1_RNG};
+        let lockstep_rng = static_init!(LockstepRng<'static>, LockstepRng::new(None, None));
+        HART1_RNG.store(lockstep_rng as *mut _, Ordering::Release);
+        let rng_driver: &'static RngDriver = static_init!(
+            RngDriver,
+            capsules_core::rng::RngDriver::new(
+                lockstep_rng,
+                board_kernel.create_grant(capsules_core::rng::DRIVER_NUM, &memory_alloc_cap),
+            )
+        );
+        kernel::hil::rng::Rng::set_client(lockstep_rng, rng_driver);
+        rng_driver
     };
 
     // Load hart 1's own, independently-linked copy of each app from its own
@@ -1168,7 +1255,17 @@ pub unsafe fn start_secondary() -> (
         scheduler_timer,
         console,
         alarm,
+        rng: rng_driver,
     };
+
+    // Register the Layer-2 upcall verifier for hart 1 before entering the
+    // kernel loop. The QemuUpcallVerifier reads mhartid at construction so
+    // the hart-0 and hart-1 instances branch correctly inside on_upcall.
+    let upcall_verifier = static_init!(
+        qemu_rv32_virt_chip::lockstep::QemuUpcallVerifier,
+        qemu_rv32_virt_chip::lockstep::QemuUpcallVerifier::new(&UPCALL_REGISTRY),
+    );
+    board_kernel.register_upcall_verifier(upcall_verifier);
 
     (board_kernel, platform, chip)
 }

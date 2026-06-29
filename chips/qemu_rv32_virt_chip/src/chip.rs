@@ -54,10 +54,28 @@ pub enum SyncEntry {
     UartRxReady { len: u8 },
     /// Hart 0 finished transmitting whatever `HART1_UART_BUF` had queued.
     UartTxDone,
-    /// Hart 0 forwarded `len` words of real entropy; they're waiting in a
-    /// replay buffer for hart 1 to replay. Not yet wired up -- see the RNG
-    /// forwarding design.
+    /// Hart 0 forwarded `len` bytes of real entropy; they're waiting in
+    /// [`RNG_REPLAY_BUF`] for hart 1 to replay via
+    /// [`crate::rng::replay_rng_done_for_hart1`].
     RngReady { len: u8 },
+
+    /// Layer-2 upcall descriptor: both harts exchange this at each intercepted
+    /// upcall boundary to verify argument equivalence before delivering the
+    /// upcall to userspace (see [`crate::lockstep::QemuUpcallVerifier`]).
+    ///
+    /// `driver_num` / `subscribe_num` identify the upcall; `r0`–`r2` carry the
+    /// masked argument values to compare (unmasked fields are zeroed).
+    ///
+    /// Note: at ~20 bytes this is wider than the 32-bit RP2350 SIO FIFO entry
+    /// this channel models. Acceptable on QEMU's software [`BiChannel`]; a
+    /// faithful RP2350 port would require word-packing.
+    UpcallDesc {
+        driver_num: u32,
+        subscribe_num: u8,
+        r0: u32,
+        r1: u32,
+        r2: u32,
+    },
 }
 
 /// Inter-hart lockstep channel for software lockstep.
@@ -103,6 +121,23 @@ unsafe impl Sync for UartRxReplayBuf {}
 #[link_section = ".bss"]
 pub static UART_RX_REPLAY_BUF: UartRxReplayBuf =
     UartRxReplayBuf(UnsafeCell::new([0u8; UART_RX_REPLAY_MAX]));
+
+/// Maximum number of bytes that can be forwarded in one RNG replay.
+/// Matches VirtIORng's internal 64-byte DMA buffer.
+pub const RNG_REPLAY_MAX: usize = 64;
+
+/// Random bytes collected by Hart 0's VirtIO RNG, to be replayed on Hart 1.
+/// Same notification-then-payload pattern as [`UART_RX_REPLAY_BUF`].
+pub struct RngReplayBuf(pub UnsafeCell<[u8; RNG_REPLAY_MAX]>);
+
+// SAFETY: Hart 0 writes strictly before pushing RngReady onto LOCKSTEP_CHAN.
+// Hart 1 reads only after popping that message. Channel ordering provides
+// the happens-before relationship.
+unsafe impl Sync for RngReplayBuf {}
+
+#[link_section = ".bss"]
+pub static RNG_REPLAY_BUF: RngReplayBuf =
+    RngReplayBuf(UnsafeCell::new([0u8; RNG_REPLAY_MAX]));
 
 /// CLINT mtime registers (read-only, shared across harts).
 const CLINT_MTIME_LO: *const u32 = 0x0200_BFF8 as *const u32;
@@ -167,6 +202,14 @@ pub fn read_mtime_low() -> u32 {
         core::arch::asm!("csrr {0}, time", out(reg) ticks);
     }
     ticks
+}
+
+pub fn current_hart() -> u32 {
+    let id: u32;
+    unsafe {
+        core::arch::asm!("csrr {0}, mhartid", out(reg) id);
+    }
+    id
 }
 
 type QemuRv32VirtPMP = rv32i::pmp::PMPUserMPU<
@@ -338,9 +381,7 @@ impl<'a, I: InterruptService + 'a> Chip for QemuRv32VirtChip<'a, I> {
             return true;
         }
 
-        let hartid: u32;
-        unsafe { core::arch::asm!("csrr {}, mhartid", out(reg) hartid) };
-        hartid == 0 && self.plic.get_saved_interrupts().is_some()
+        current_hart() == 0 && self.plic.get_saved_interrupts().is_some()
     }
 
     fn sleep(&self) {
@@ -401,9 +442,7 @@ unsafe fn handle_interrupt(intr: mcause::Interrupt) {
 
         mcause::Interrupt::MachineSoft => {
             CSR.mie.modify(mie::msoft::CLEAR);
-            let hartid: u32;
-            core::arch::asm!("csrr {}, mhartid", out(reg) hartid);
-            if hartid == 1 {
+            if current_hart() == 1 {
                 core::ptr::write_volatile(CLINT_MSIP1, 0); // clear MSIP[1]
 
                 // Arm hart 1's hardware watchdog timer. If hart 0 doesn't
@@ -432,9 +471,7 @@ unsafe fn handle_interrupt(intr: mcause::Interrupt) {
             }
         }
         mcause::Interrupt::MachineTimer => {
-            let hartid: u32;
-            core::arch::asm!("csrr {}, mhartid", out(reg) hartid);
-            if hartid == 0 {
+            if current_hart() == 0 {
                 IRQ_ACTIVE.store(true, Ordering::Release);
                 core::ptr::write_volatile(CLINT_MSIP1, 1);
                 CSR.mie.modify(mie::mtimer::CLEAR);
