@@ -26,7 +26,8 @@
 //! `UpcallAction::Proceed` for every registered upcall, preserving existing
 //! behaviour while the infrastructure is wired up.
 
-use crate::chip::{read_mtime_low, SyncEntry, LOCKSTEP_CHAN};
+use crate::chip::{clear_irq_active, read_mtime_low, SyncEntry, SyscallDesc, LOCKSTEP_CHAN};
+use kernel::syscall::LockstepPayload;
 use kernel::hil;
 use kernel::platform::{UpcallAction, UpcallVerifier};
 use kernel::upcall::UpcallId;
@@ -77,20 +78,200 @@ pub const DRAIN_TIMEOUT_MTIME_TICKS: u32 = 1_000_000_000;
 // Layer-1 event dispatch
 // ---------------------------------------------------------------------------
 
-/// Replay a single Layer-1 channel event on hart 1.
+/// Replay a single Layer-1/Layer-2 channel event on hart 1.
 ///
-/// Layer-1 events (`UartRxReady`, `UartTxDone`, `RngReady`) carry replayed
-/// hardware inputs from hart 0. Hart 0 owns the real peripherals and never
-/// receives these, so this function is only meaningful on hart 1. It is the
-/// `dispatch` callback passed to [`lockstep_barrier`].
+/// Layer-1 events (`UartRxReady`, `UartTxDone`) carry replayed hardware
+/// inputs from hart 0. `SyscallDesc` is a Layer-2 descriptor stored here
+/// for [`LockstepDriver`] to compare in Phase 2. Hart 0 owns the real
+/// peripherals and never receives these, so this function is only meaningful
+/// on hart 1. It is the `dispatch` callback passed to [`lockstep_barrier`].
 pub fn dispatch_layer1_event(entry: SyncEntry) {
     match entry {
         SyncEntry::UartRxReady { len } => crate::uart::replay_rx_done_for_hart1(len),
         SyncEntry::UartTxDone => crate::uart::replay_tx_done_for_hart1(),
-        SyncEntry::RngReady { len } => crate::rng::replay_rng_done_for_hart1(len),
+        SyncEntry::SyscallDesc(desc) => store_pending_syscall(desc),
         SyncEntry::Sync { .. } | SyncEntry::UpcallDesc { .. } => {
             unreachable!("lockstep_barrier descriptors must not be dispatched as Layer-1 events")
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layer-2 syscall descriptor storage (hart 1)
+// ---------------------------------------------------------------------------
+
+/// SPSC queue of [`SyncEntry::SyscallDesc`] entries buffered for Phase-2
+/// comparison. Capacity matches [`LOCKSTEP_CHAN`]'s per-direction capacity so
+/// every descriptor that fits in the channel also fits here.
+///
+/// Producer: hart 1 Phase-1 drain (via [`store_pending_syscall`]).
+/// Consumer: hart 1 Phase-2 [`LockstepDriver::command`] (via [`take_pending_syscall`]).
+///
+/// Both sides run on hart 1 sequentially (Phase 1 completes before Phase 2
+/// starts), so there is no concurrent access — the SPSC invariant holds
+/// trivially.
+static PENDING_SYSCALLS_H1: kernel::collections::spsc_channel::SpscChannel<4, SyscallDesc> =
+    kernel::collections::spsc_channel::SpscChannel::new();
+
+/// Enqueue a [`SyscallDesc`] received from hart 0 for comparison in Phase 2.
+/// Called by [`dispatch_layer1_event`] during hart 1's Phase-1 drain.
+pub fn store_pending_syscall(desc: SyscallDesc) {
+    while !PENDING_SYSCALLS_H1.push(desc) {
+        core::hint::spin_loop();
+    }
+}
+
+fn take_pending_syscall() -> Option<SyscallDesc> {
+    PENDING_SYSCALLS_H1.pop()
+}
+
+// ---------------------------------------------------------------------------
+// LockstepDriver — Layer-2 syscall interceptor (Stage 1)
+// ---------------------------------------------------------------------------
+
+/// Wraps any [`kernel::syscall::SyscallDriver`] and exchanges a
+/// [`SyncEntry::SyscallDesc`] on each `command()` call.
+///
+/// - **Hart 0**: pushes a descriptor (with optional payload fingerprint) to
+///   [`LOCKSTEP_CHAN`] then immediately dispatches to `inner`.
+/// - **Hart 1**: pops the descriptor stored by [`dispatch_layer1_event`]
+///   during Phase 1, compares scalar args and payload fingerprint, panics on
+///   mismatch, then dispatches.
+///
+/// Set `payload_allow_num` to `Some(slot)` to fingerprint the app's RO-allow
+/// buffer at that slot before each `command()`. For the console driver, slot 1
+/// is the TX buffer (`ro_allow::WRITE`). Use `None` for drivers with no payload
+/// worth fingerprinting (e.g., alarm, where the key divergence is in args).
+///
+/// Before-emit gating (hart 0 blocking until hart 1 confirms) is added in
+/// Stage 2 once the per-boundary concurrent rendezvous primitive is in place.
+pub struct LockstepDriver<'a, D: kernel::syscall::SyscallDriver + LockstepPayload> {
+    inner: &'a D,
+    driver_num: usize,
+    hart_id: u32,
+}
+
+impl<'a, D: kernel::syscall::SyscallDriver + LockstepPayload> LockstepDriver<'a, D> {
+    pub fn new(inner: &'a D, driver_num: usize) -> Self {
+        Self { inner, driver_num, hart_id: crate::chip::current_hart() }
+    }
+}
+
+impl<D: kernel::syscall::SyscallDriver + LockstepPayload> kernel::syscall::SyscallDriver
+    for LockstepDriver<'_, D>
+{
+    fn command(
+        &self,
+        cmd: usize,
+        arg0: usize,
+        arg1: usize,
+        processid: kernel::ProcessId,
+    ) -> kernel::syscall::CommandReturn {
+        let payload_fp = self.inner.command_payload_fp(cmd, processid);
+        let desc = SyscallDesc {
+            driver_num: self.driver_num as u32,
+            sub: cmd as u8,
+            arg0: arg0 as u32,
+            arg1: arg1 as u32,
+            payload_fp,
+        };
+        if self.hart_id == 0 {
+            // Send our descriptor to hart 1 and wake it.
+            while !LOCKSTEP_CHAN.a_send(SyncEntry::SyscallDesc(desc)) {
+                core::hint::spin_loop();
+            }
+            unsafe { core::ptr::write_volatile(crate::chip::CLINT_MSIP1, 1) };
+
+            // Gate: block until hart 1 confirms the same descriptor before
+            // calling self.inner.command() (which fires the real UART TX).
+            let start = read_mtime_low();
+            loop {
+                match LOCKSTEP_CHAN.a_recv() {
+                    Some(SyncEntry::SyscallDesc(SyscallDesc {
+                        driver_num: d,
+                        sub: s,
+                        arg0: a0,
+                        arg1: a1,
+                        payload_fp: fp,
+                    })) => {
+                        if d != desc.driver_num
+                            || s != desc.sub
+                            || a0 != desc.arg0
+                            || a1 != desc.arg1
+                            || fp != desc.payload_fp
+                        {
+                            panic!(
+                                "Lockstep Layer-2 gate: descriptor mismatch driver {}: \
+                                 h0=(sub={},a0={:#x},a1={:#x},fp={:#010x}) \
+                                 h1=(sub={s},a0={a0:#x},a1={a1:#x},fp={fp:#010x})",
+                                self.driver_num,
+                                desc.sub,
+                                desc.arg0,
+                                desc.arg1,
+                                desc.payload_fp,
+                            );
+                        }
+                        break;
+                    }
+                    Some(_unexpected) => panic!(
+                        "Lockstep Layer-2 gate: unexpected channel entry while waiting \
+                         for hart 1 confirmation (driver {}, sub {cmd})",
+                        self.driver_num,
+                    ),
+                    None => {}
+                }
+                // A timer interrupt may have set IRQ_ACTIVE while we block here.
+                // Clear it so the watchdog doesn't mistake this gate wait for a
+                // hung interrupt handler; the gate's own timeout catches real hangs.
+                clear_irq_active();
+                if read_mtime_low().wrapping_sub(start) >= SYNC_TIMEOUT_MTIME_TICKS {
+                    panic!(
+                        "Lockstep Layer-2 gate: timeout waiting for hart 1 \
+                         (driver {}, sub {cmd})",
+                        self.driver_num,
+                    );
+                }
+                core::hint::spin_loop();
+            }
+        } else {
+            match take_pending_syscall() {
+                Some(SyscallDesc {
+                    driver_num: d,
+                    sub: s,
+                    arg0: a0,
+                    arg1: a1,
+                    payload_fp: fp,
+                }) => {
+                    if d != self.driver_num as u32
+                        || s != cmd as u8
+                        || a0 != arg0 as u32
+                        || a1 != arg1 as u32
+                        || fp != payload_fp
+                    {
+                        panic!(
+                            "Lockstep Layer-2: syscall mismatch driver {}: \
+                             h0=(d={d},sub={s},a0={a0:#x},a1={a1:#x},fp={fp:#010x}) \
+                             h1=(sub={cmd},a0={arg0:#x},a1={arg1:#x},fp={payload_fp:#010x})",
+                            self.driver_num,
+                        );
+                    }
+                    // Send our descriptor back as confirmation. Hart 0 is
+                    // spin-polling a_recv(), so no MSIP kick is needed.
+                    while !LOCKSTEP_CHAN.b_send(SyncEntry::SyscallDesc(desc)) {
+                        core::hint::spin_loop();
+                    }
+                }
+                None => panic!(
+                    "Lockstep Layer-2: hart 1 driver {} sub {cmd} has no matching h0 descriptor",
+                    self.driver_num,
+                ),
+            }
+        }
+        self.inner.command(cmd, arg0, arg1, processid)
+    }
+
+    fn allocate_grant(&self, processid: kernel::ProcessId) -> Result<(), kernel::process::Error> {
+        self.inner.allocate_grant(processid)
     }
 }
 
@@ -457,54 +638,3 @@ impl UartHooks for QemuUartHooks {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RngHooks — per-HIL sync logic for RNG
-// ---------------------------------------------------------------------------
-
-/// Callback invoked by [`LockstepRng`] after draining an entropy batch.
-///
-/// `words` contains the `u32` words drained from the VirtIO iterator. On
-/// hart 0 the implementor copies them to the replay buffer and notifies hart 1.
-/// On hart 1 the implementor is typically a no-op.
-pub trait RngHooks {
-    fn on_randomness_available(&self, words: &[u32]);
-}
-
-// ---------------------------------------------------------------------------
-// QemuRngHooks — QEMU-specific RNG sync implementation
-// ---------------------------------------------------------------------------
-
-/// QEMU-specific RNG lockstep hooks.
-///
-/// On hart 0: copies the word batch to `RNG_REPLAY_BUF` in little-endian byte
-/// order, pushes `RngReady` onto the channel, and asserts MSIP[1] to wake hart
-/// 1. On hart 1: no-op.
-pub struct QemuRngHooks {
-    hart_id: u32,
-}
-
-impl QemuRngHooks {
-    pub fn new() -> Self {
-        Self { hart_id: crate::chip::current_hart() }
-    }
-}
-
-impl RngHooks for QemuRngHooks {
-    fn on_randomness_available(&self, words: &[u32]) {
-        if self.hart_id == 0 && !words.is_empty() {
-            use crate::chip::{CLINT_MSIP1, LOCKSTEP_CHAN, RNG_REPLAY_BUF, SyncEntry};
-            let byte_len = (words.len() * 4).min(crate::chip::RNG_REPLAY_MAX);
-            let word_count = byte_len / 4;
-            unsafe {
-                let buf = &mut *RNG_REPLAY_BUF.0.get();
-                for (i, &w) in words[..word_count].iter().enumerate() {
-                    buf[i * 4..(i + 1) * 4].copy_from_slice(&u32::to_le_bytes(w));
-                }
-            }
-            while !LOCKSTEP_CHAN.a_send(SyncEntry::RngReady { len: byte_len as u8 }) {
-                core::hint::spin_loop();
-            }
-            unsafe { core::ptr::write_volatile(CLINT_MSIP1, 1) };
-        }
-    }
-}

@@ -15,5 +15,4 @@ pub mod chip;
 pub mod clint;
 pub mod lockstep;
 pub mod plic;
-pub mod rng;
 pub mod uart;

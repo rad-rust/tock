@@ -680,6 +680,10 @@ pub fn replay_tx_done_for_hart1() {
     HART1_UART_BUF.replay_tx_done();
 }
 
+pub fn replay_pending_tx_done_for_hart1() {
+    HART1_UART_BUF.replay_pending_tx_done();
+}
+
 /// Software-only UART with no hardware backing, used for Hart 1's console capsule.
 ///
 /// Hart 0 owns the physical UART. Hart 1 receives data via the MSIP replay path:
@@ -692,6 +696,10 @@ pub struct VirtualUartBuffer {
     rx_buffer: TakeCell<'static, [u8]>,
     tx_buffer: TakeCell<'static, [u8]>,
     tx_len: Cell<usize>,
+    // Set when replay_tx_done() fires before transmit_buffer() is called
+    // (hart 0 completes TX before hart 1's process has issued the command).
+    // transmit_buffer() checks this flag and fires the callback immediately.
+    tx_done_early: Cell<bool>,
 }
 
 unsafe impl Sync for VirtualUartBuffer {}
@@ -704,6 +712,7 @@ impl VirtualUartBuffer {
             rx_buffer: TakeCell::empty(),
             tx_buffer: TakeCell::empty(),
             tx_len: Cell::new(0),
+            tx_done_early: Cell::new(false),
         }
     }
 
@@ -727,11 +736,23 @@ impl VirtualUartBuffer {
     pub fn replay_tx_done(&self) {
         let tx_buffer = match self.tx_buffer.take() {
             Some(buf) => buf,
-            None => return,
+            None => {
+                self.tx_done_early.set(true);
+                return;
+            }
         };
+        self.tx_done_early.set(false);
         let tx_len = self.tx_len.get();
         self.tx_client
             .map(move |client| client.transmitted_buffer(tx_buffer, tx_len, Ok(())));
+    }
+
+    /// Called from the hart-1 main loop after each kernel_loop_operation to
+    /// drain any TX-done event that arrived before the capsule's transmit_buffer.
+    pub fn replay_pending_tx_done(&self) {
+        if self.tx_done_early.get() {
+            self.replay_tx_done();
+        }
     }
 }
 

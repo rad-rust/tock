@@ -42,6 +42,23 @@ use virtio::transports::mmio::VirtIOMMIODevice;
 /// the kick, computed from its own `read_mtime()`, not a value hart 0 could
 /// usefully forward. It stays unconditional on every `MachineSoft` entry,
 /// regardless of channel content.
+/// Payload of a Layer-2 syscall descriptor exchanged between harts.
+///
+/// Extracted from [`SyncEntry::SyscallDesc`] so it can be stored in the
+/// hart-1 pending queue ([`crate::lockstep::PENDING_SYSCALLS_H1`]) without
+/// carrying the full [`SyncEntry`] discriminant and other variants' data.
+///
+/// `payload_fp` is an FNV-1a fingerprint of the app's RO-allow buffer at
+/// the configured slot (0 if no payload slot is wired up for this driver).
+#[derive(Clone, Copy)]
+pub struct SyscallDesc {
+    pub driver_num: u32,
+    pub sub: u8,
+    pub arg0: u32,
+    pub arg1: u32,
+    pub payload_fp: u32,
+}
+
 #[derive(Clone, Copy)]
 pub enum SyncEntry {
     /// Per-iteration lockstep barrier, and the one-time init handshake.
@@ -54,10 +71,11 @@ pub enum SyncEntry {
     UartRxReady { len: u8 },
     /// Hart 0 finished transmitting whatever `HART1_UART_BUF` had queued.
     UartTxDone,
-    /// Hart 0 forwarded `len` bytes of real entropy; they're waiting in
-    /// [`RNG_REPLAY_BUF`] for hart 1 to replay via
-    /// [`crate::rng::replay_rng_done_for_hart1`].
-    RngReady { len: u8 },
+
+    /// Layer-2 syscall descriptor: hart 0 pushes this before dispatching each
+    /// intercepted `Command` syscall; hart 1 stores it during Phase-1 drain
+    /// and pops it in Phase 2 for comparison (see [`crate::lockstep::LockstepDriver`]).
+    SyscallDesc(SyscallDesc),
 
     /// Layer-2 upcall descriptor: both harts exchange this at each intercepted
     /// upcall boundary to verify argument equivalence before delivering the
@@ -121,23 +139,6 @@ unsafe impl Sync for UartRxReplayBuf {}
 #[link_section = ".bss"]
 pub static UART_RX_REPLAY_BUF: UartRxReplayBuf =
     UartRxReplayBuf(UnsafeCell::new([0u8; UART_RX_REPLAY_MAX]));
-
-/// Maximum number of bytes that can be forwarded in one RNG replay.
-/// Matches VirtIORng's internal 64-byte DMA buffer.
-pub const RNG_REPLAY_MAX: usize = 64;
-
-/// Random bytes collected by Hart 0's VirtIO RNG, to be replayed on Hart 1.
-/// Same notification-then-payload pattern as [`UART_RX_REPLAY_BUF`].
-pub struct RngReplayBuf(pub UnsafeCell<[u8; RNG_REPLAY_MAX]>);
-
-// SAFETY: Hart 0 writes strictly before pushing RngReady onto LOCKSTEP_CHAN.
-// Hart 1 reads only after popping that message. Channel ordering provides
-// the happens-before relationship.
-unsafe impl Sync for RngReplayBuf {}
-
-#[link_section = ".bss"]
-pub static RNG_REPLAY_BUF: RngReplayBuf =
-    RngReplayBuf(UnsafeCell::new([0u8; RNG_REPLAY_MAX]));
 
 /// CLINT mtime registers (read-only, shared across harts).
 const CLINT_MTIME_LO: *const u32 = 0x0200_BFF8 as *const u32;
