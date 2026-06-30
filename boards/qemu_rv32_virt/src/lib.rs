@@ -331,6 +331,7 @@ pub unsafe fn start() -> (
         QemuRv32VirtDefaultPeripherals,
         QemuRv32VirtDefaultPeripherals::new(),
     );
+    kernel::deferred_call::DeferredCallClient::register(&peripherals.uart0);
 
     // Create a shared UART channel for the console and for kernel
     // debug over the provided memory-mapped 16550-compatible UART.
@@ -1118,6 +1119,7 @@ pub unsafe fn start_secondary() -> (
         QemuRv32VirtDefaultPeripherals,
         QemuRv32VirtDefaultPeripherals::new(),
     );
+    kernel::deferred_call::DeferredCallClient::register(&peripherals.uart0);
 
     let chip = static_init!(
         QemuRv32VirtChip<QemuRv32VirtDefaultPeripherals>,
