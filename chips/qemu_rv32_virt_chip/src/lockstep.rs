@@ -603,11 +603,7 @@ impl QemuUartHooks {
 }
 
 impl UartHooks for QemuUartHooks {
-    fn on_transmit(&self, _buf: &[u8]) {
-        // TODO(lockstep-stage1): fingerprint _buf, lockstep_barrier with partner
-        // hart, panic on mismatch. Gate hart 0 on hart 1's confirmation before
-        // forwarding to the inner driver.
-    }
+    fn on_transmit(&self, _buf: &[u8]) {}
 
     fn on_transmitted(&self, _buf: &[u8]) {
         if self.hart_id == 0 {

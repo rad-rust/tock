@@ -238,7 +238,10 @@ pub struct Uart16550<'a> {
     /// Deferred call used to deliver received bytes to the console capsule
     /// outside of the `receive_buffer()` call stack, avoiding a grant re-entry
     /// when data is already in the FIFO at the time `receive_buffer` is called.
-    rx_deferred_call: DeferredCall,
+    /// `None` on hart 1, where the real UART is never driven and the deferred
+    /// call system is owned by hart 0's thread (SingleThreadValue cannot bind
+    /// to two threads).
+    rx_deferred_call: Option<DeferredCall>,
 }
 
 impl<'a> Uart16550<'a> {
@@ -265,14 +268,16 @@ impl<'a> Uart16550<'a> {
             rx_sw_buf: UnsafeCell::new([0u8; RX_SW_FIFO_CAP]),
             rx_sw_head: Cell::new(0),
             rx_sw_count: Cell::new(0),
-            rx_deferred_call: DeferredCall::new(),
+            rx_deferred_call: if hart_id == 0 { Some(DeferredCall::new()) } else { None },
         }
     }
 }
 
 impl DeferredCallClient for Uart16550<'_> {
     fn register(&'static self) {
-        self.rx_deferred_call.register(self);
+        if let Some(dc) = &self.rx_deferred_call {
+            dc.register(self);
+        }
     }
 
     fn handle_deferred_call(&self) {
@@ -664,7 +669,9 @@ impl<'a> hil::uart::Receive<'a> for Uart16550<'a> {
         // same grant a second time and panic.
         self.regs.ier.modify(IER::ReceivedDataAvailable::SET);
         if self.rx_sw_count.get() > 0 || self.regs.lsr.is_set(LSR::DataAvailable) {
-            self.rx_deferred_call.set();
+            if let Some(dc) = &self.rx_deferred_call {
+                dc.set();
+            }
         }
 
         Ok(())

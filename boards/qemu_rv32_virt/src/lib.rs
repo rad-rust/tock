@@ -1235,7 +1235,6 @@ pub unsafe fn start_secondary() -> (
         &process_mgmt_cap,
     );
 
-    debug!("[H1] start_secondary: after load_processes");
     if let Err(err) = load_result {
         debug!("Hart 1: error loading processes!");
         debug!("{:?}", err);

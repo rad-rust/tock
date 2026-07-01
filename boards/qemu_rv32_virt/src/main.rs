@@ -346,12 +346,12 @@ pub unsafe fn main() {
     // 0's own process state is fully set up first.
     qemu_rv32_virt_lib::finish_lockstep_setup();
 
-    debug!("Entering main loop.");
-
     // Drain any interrupts/deferred calls left over from peripheral
     // initialization (VirtIO negotiation, RNG buffer setup, etc.) to avoid
     // a spurious one-round divergence at boot.
     board_kernel.kernel_preloop_operation(&platform, chip, &main_loop_capability);
+
+    debug!("Entering main loop.");
 
     loop {
         let activity = board_kernel.kernel_loop_operation(
