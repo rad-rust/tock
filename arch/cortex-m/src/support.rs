@@ -24,6 +24,43 @@ pub unsafe fn wfi() {
     asm!("wfi", options(nomem, preserves_flags));
 }
 
+/// SEV (send event) instruction
+///
+/// Wakes any other core in the same multiprocessor system that is blocked
+/// in a WFE instruction.
+#[cfg(any(doc, all(target_arch = "arm", target_os = "none")))]
+#[inline(always)]
+pub unsafe fn sev() {
+    use core::arch::asm;
+    asm!("sev", options(nomem, nostack, preserves_flags));
+}
+
+/// WFE (wait for event) instruction
+///
+/// Sleeps until an event (e.g. a peer core's SEV, or a pending exception)
+/// wakes this core, or returns immediately if the event register is
+/// already set.
+#[cfg(any(doc, all(target_arch = "arm", target_os = "none")))]
+#[inline(always)]
+pub unsafe fn wfe() {
+    use core::arch::asm;
+    asm!("wfe", options(nomem, preserves_flags));
+}
+
+/// DMB (data memory barrier) instruction
+///
+/// Ensures all memory accesses (loads and stores) issued by this core before
+/// the barrier are observed by other bus masters (e.g. a peer core reading
+/// shared SRAM) before any accesses issued after the barrier. Needed around
+/// shared-memory handoffs between cores, since Cortex-M's write buffer can
+/// otherwise reorder visibility across cores.
+#[cfg(any(doc, all(target_arch = "arm", target_os = "none")))]
+#[inline(always)]
+pub unsafe fn dmb() {
+    use core::arch::asm;
+    asm!("dmb", options(nomem, nostack, preserves_flags));
+}
+
 /// Single-core critical section operation
 #[cfg(any(doc, all(target_arch = "arm", target_os = "none")))]
 pub unsafe fn with_interrupts_disabled<F, R>(f: F) -> R
@@ -51,6 +88,24 @@ pub fn nop() {
 /// WFI instruction (mock)
 #[cfg(not(any(doc, all(target_arch = "arm", target_os = "none"))))]
 pub unsafe fn wfi() {
+    unimplemented!()
+}
+
+/// SEV instruction (mock)
+#[cfg(not(any(doc, all(target_arch = "arm", target_os = "none"))))]
+pub unsafe fn sev() {
+    unimplemented!()
+}
+
+/// WFE instruction (mock)
+#[cfg(not(any(doc, all(target_arch = "arm", target_os = "none"))))]
+pub unsafe fn wfe() {
+    unimplemented!()
+}
+
+/// DMB instruction (mock)
+#[cfg(not(any(doc, all(target_arch = "arm", target_os = "none"))))]
+pub unsafe fn dmb() {
     unimplemented!()
 }
 

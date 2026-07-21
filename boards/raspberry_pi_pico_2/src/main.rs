@@ -20,6 +20,7 @@ use components::led::LedsComponent;
 use enum_primitive::cast::FromPrimitive;
 use kernel::component::Component;
 use kernel::debug::PanicResources;
+use kernel::hil;
 use kernel::hil::led::LedHigh;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
 use kernel::syscall::SyscallDriver;
@@ -33,6 +34,11 @@ use rp2350::clocks::{
     SystemClockSource, UsbAuxiliaryClockSource,
 };
 use rp2350::gpio::{GpioFunction, RPGpio, RPGpioPin};
+use rp2350::lockstep::{
+    dispatch_layer1_event, lockstep_barrier, DriverUpcallRules, LockstepDriver, LockstepUart,
+    Rp2350UartHooks, Rp2350UpcallVerifier, SyncEntry, Transport as _, UpcallMode, UpcallRule,
+    RP2350_TRANSPORT,
+};
 use rp2350::resets::Peripheral;
 use rp2350::timer::RPTimer;
 #[allow(unused)]
@@ -69,6 +75,33 @@ const FAULT_RESPONSE: capsules_system::process_policies::PanicFaultPolicy =
 // Number of concurrent processes this platform supports.
 const NUM_PROCS: usize = 4;
 
+// ---------------------------------------------------------------------------
+// Layer-2 upcall-verifier registry (compare-mode for console upcalls)
+// ---------------------------------------------------------------------------
+//
+// Mirrors qemu_rv32_virt_lib's CONSOLE_UPCALL_RULES/UPCALL_REGISTRY exactly --
+// console driver_num/subscribe_num semantics are capsule-level, not
+// chip-specific. `Rp2350UpcallVerifier::on_upcall` doesn't yet act on these
+// (see its doc comment), but the registry itself is live and shared by both
+// cores' verifiers.
+static CONSOLE_UPCALL_RULES: [UpcallRule; 2] = [
+    UpcallRule {
+        subscribe_num: 1, // subscribe_num 1 = WRITE_DONE in capsules_core::console
+        mode: UpcallMode::Compare,
+        mask: (true, false, false), // r0 = bytes written; r1/r2 unused
+    },
+    UpcallRule {
+        subscribe_num: 2, // subscribe_num 2 = READ_DONE
+        mode: UpcallMode::Compare,
+        mask: (true, false, false), // r0 = bytes read; r1/r2 unused
+    },
+];
+
+static UPCALL_REGISTRY: [DriverUpcallRules; 1] = [DriverUpcallRules {
+    driver_num: capsules_core::console::DRIVER_NUM,
+    rules: &CONSOLE_UPCALL_RULES,
+}];
+
 type ChipHw = Rp2350<'static, Rp2350DefaultPeripherals<'static>>;
 type ProcessPrinterInUse = capsules_system::process_printer::ProcessPrinterText;
 
@@ -76,14 +109,25 @@ type ProcessPrinterInUse = capsules_system::process_printer::ProcessPrinterText;
 static PANIC_RESOURCES: SingleThreadValue<PanicResources<ChipHw, ProcessPrinterInUse>> =
     SingleThreadValue::new();
 
-type SchedulerInUse = components::sched::round_robin::RoundRobinComponentType;
+// Cooperative on both cores, not this board's original RoundRobin: matches
+// qemu_rv32_virt's hart 0/1 (both Cooperative), which deliberately use the
+// same scheduler on both sides so fine-grained Layer-2 syscall lockstep sees
+// identical scheduling decisions -- preemption timing included -- round for
+// round. A RoundRobin/SysTick core racing against a Cooperative peer (or a
+// mismatched pair of the two) can land a process's syscalls on different
+// rounds than its peer, which is what caused "shadow ... has no matching
+// leader descriptor" panics during lockstep bring-up.
+type SchedulerInUse = components::sched::cooperative::CooperativeComponentType;
 
 /// Supported drivers by the platform
 pub struct RaspberryPiPico2 {
     ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
-    console: &'static capsules_core::console::Console<'static>,
+    lockstep_console: &'static LockstepDriver<
+        'static,
+        rp2350::lockstep::Rp2350Transport,
+        capsules_core::console::Console<'static>,
+    >,
     scheduler: &'static SchedulerInUse,
-    systick: cortexm33::systick::SysTick,
     alarm: &'static capsules_core::alarm::AlarmDriver<
         'static,
         VirtualMuxAlarm<'static, rp2350::timer::RPTimer<'static>>,
@@ -98,7 +142,7 @@ impl SyscallDriverLookup for RaspberryPiPico2 {
         F: FnOnce(Option<&dyn SyscallDriver>) -> R,
     {
         match driver_num {
-            capsules_core::console::DRIVER_NUM => f(Some(self.console)),
+            capsules_core::console::DRIVER_NUM => f(Some(self.lockstep_console)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules_core::gpio::DRIVER_NUM => f(Some(self.gpio)),
             capsules_core::led::DRIVER_NUM => f(Some(self.led)),
@@ -113,7 +157,7 @@ impl KernelResources<Rp2350<'static, Rp2350DefaultPeripherals<'static>>> for Ras
     type SyscallFilter = ();
     type ProcessFault = ();
     type Scheduler = SchedulerInUse;
-    type SchedulerTimer = cortexm33::systick::SysTick;
+    type SchedulerTimer = ();
     type WatchDog = ();
     type ContextSwitchCallback = ();
 
@@ -130,7 +174,7 @@ impl KernelResources<Rp2350<'static, Rp2350DefaultPeripherals<'static>>> for Ras
         self.scheduler
     }
     fn scheduler_timer(&self) -> &Self::SchedulerTimer {
-        &self.systick
+        &()
     }
     fn watchdog(&self) -> &Self::WatchDog {
         &()
@@ -170,6 +214,293 @@ core::arch::global_asm!(
     bx r2
     "
 );
+
+// ---------------------------------------------------------------------------
+// Core 1 — lockstep shadow kernel (Stage A4)
+// ---------------------------------------------------------------------------
+//
+// Core 1 runs its own, independent, peripheral-free Tock kernel instance:
+// its own Clocks/SIO/TIMER0 handles (fresh value-type wrappers around the
+// same MMIO -- see the module doc below for why these don't need to be
+// shared with core 0's), own process array, own Cooperative scheduler (so it
+// never needs a scheduler-timer alarm channel, which would otherwise contend
+// with core 0's use of TIMER0's shared alarm registers), and no console/gpio/
+// led/ipc drivers at all. Layer-1 peripheral-input replay and Layer-2
+// syscall verification are not wired up yet (Step B) -- Stage A only proves
+// the two independent kernel loops stay in fingerprint lockstep.
+
+/// Number of concurrent processes core 1's shadow kernel supports. Kept at 1
+/// (vs. core 0's `NUM_PROCS`): Stage A only needs to run a single
+/// peripheral-light test app (e.g. yield-test) on both cores.
+const NUM_PROCS_H1: usize = 1;
+
+// SCRATCH DIAGNOSTIC (fail-stop verification): plain shared atomics, safe to
+// write from core 1 without touching the UART directly (raw io::WRITER
+// writes from core 1 race with core 0's own interrupt-driven UART use --
+// confirmed by an earlier attempt that produced visibly interleaved output).
+// Core 0 reports these periodically via its own, already-safe kernel::debug!
+// path in its main loop below.
+static CORE1_STAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static CORE1_ROUND: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Count of UartTxDone/UartRxReady/SyscallDesc Layer-1/2 events dispatched
+/// on core 1 so far. Also readable from the panic handler (io.rs), which
+/// reliably flushes even when triggered from core 1 (see the comment above).
+static CORE1_L1_EVENT_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Core 1's minimal, peripheral-free platform.
+struct Core1Platform {
+    scheduler: &'static components::sched::cooperative::CooperativeComponentType,
+    lockstep_console: &'static LockstepDriver<
+        'static,
+        rp2350::lockstep::Rp2350Transport,
+        capsules_core::console::Console<'static>,
+    >,
+}
+
+impl SyscallDriverLookup for Core1Platform {
+    fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
+    where
+        F: FnOnce(Option<&dyn SyscallDriver>) -> R,
+    {
+        match driver_num {
+            capsules_core::console::DRIVER_NUM => f(Some(self.lockstep_console)),
+            _ => f(None),
+        }
+    }
+}
+
+impl KernelResources<Rp2350<'static, Rp2350DefaultPeripherals<'static>>> for Core1Platform {
+    type SyscallDriverLookup = Self;
+    type SyscallFilter = ();
+    type ProcessFault = ();
+    // Must match core 0's scheduler exactly. Fine-grained Layer-2 syscall
+    // lockstep needs both cores to make identical scheduling decisions --
+    // preemption timing included -- round for round; a mismatch here (this
+    // used to be Cooperative on core 1 vs. core 0's original RoundRobin) is
+    // what caused "shadow ... has no matching leader descriptor" panics.
+    // Both cores now use Cooperative (matching qemu_rv32_virt's hart 0/1,
+    // which deliberately use the same scheduler for the same reason) rather
+    // than giving core 1 a RoundRobin+SysTick pairing, since Cooperative
+    // needs no `SchedulerTimer` at all -- simpler than keeping two SysTick
+    // instances in sync.
+    type Scheduler = components::sched::cooperative::CooperativeComponentType;
+    type SchedulerTimer = ();
+    type WatchDog = ();
+    type ContextSwitchCallback = ();
+
+    fn syscall_driver_lookup(&self) -> &Self::SyscallDriverLookup {
+        self
+    }
+    fn syscall_filter(&self) -> &Self::SyscallFilter {
+        &()
+    }
+    fn process_fault(&self) -> &Self::ProcessFault {
+        &()
+    }
+    fn scheduler(&self) -> &Self::Scheduler {
+        self.scheduler
+    }
+    fn scheduler_timer(&self) -> &Self::SchedulerTimer {
+        &()
+    }
+    fn watchdog(&self) -> &Self::WatchDog {
+        &()
+    }
+    fn context_switch_callback(&self) -> &Self::ContextSwitchCallback {
+        &()
+    }
+}
+
+/// Entry point for core 1, branched to directly by the bootrom after the
+/// `SIO::launch_core1` handshake (not a hardware reset — `BASE_VECTORS[1]`
+/// is never executed on core 1). The bootrom protocol already sets core 1's
+/// initial SP and VTOR from the values core 0 passed to `launch_core1`, so
+/// unlike a from-reset boot, no assembly preamble is needed here.
+#[no_mangle]
+pub unsafe extern "C" fn core1_entry() -> ! {
+    let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
+
+    // SCRATCH DIAGNOSTIC: prove core 1 reaches this point at all.
+    CORE1_STAGE.store(1, core::sync::atomic::Ordering::Relaxed);
+
+    // Boot handshake: wait for core 0's one-time init Sync (pushed after
+    // load_processes(), see main()), and echo it back. Reusing
+    // `lockstep_barrier` for this (rather than hand-rolled channel calls)
+    // gives the handshake the same bounded timeout / panic-on-divergence
+    // behavior as every subsequent per-round barrier. Dispatch is wired to
+    // `dispatch_layer1_event` defensively -- core 0 doesn't push Layer-1
+    // events this early, but there's no reason to assume it can't.
+    lockstep_barrier(
+        &RP2350_TRANSPORT,
+        SyncEntry::Sync { fingerprint: 0 },
+        dispatch_layer1_event,
+    );
+
+    // SCRATCH DIAGNOSTIC
+    CORE1_STAGE.store(2, core::sync::atomic::Ordering::Relaxed);
+
+    // Fresh, independent peripheral handles -- NOT shared with core 0's.
+    // `Clocks` caches configured frequencies in `Cell`s, which are neither
+    // `Sync` (unsound to alias across cores) nor pre-populated by a second,
+    // separately-constructed instance; sharing it would need cross-core
+    // synchronization stage A doesn't require. Core 1 only ever touches
+    // `.sio` and `.timer0` below, both of which are stateless MMIO wrappers
+    // that don't depend on `Clocks` at all, so a fresh, unconfigured
+    // `Clocks::new()` is harmless as long as core 1 never calls anything
+    // that reads it (no uart/xosc/adc use here). `.init()` is deliberately
+    // never called on this instance either, to avoid redundant writes to
+    // shared hardware (e.g. the ticks generator) core 0 already configured.
+    let clocks = static_init!(rp2350::clocks::Clocks, rp2350::clocks::Clocks::new());
+    let peripherals = static_init!(
+        Rp2350DefaultPeripherals,
+        Rp2350DefaultPeripherals::new(clocks)
+    );
+
+    let chip = static_init!(
+        Rp2350<Rp2350DefaultPeripherals>,
+        Rp2350::new(peripherals, &peripherals.sio)
+    );
+
+    let processes = components::process_array::ProcessArrayComponent::new()
+        .finalize(components::process_array_component_static!(NUM_PROCS_H1));
+    let board_kernel = static_init!(Kernel, Kernel::new(processes.as_slice()));
+
+    let scheduler = components::sched::cooperative::CooperativeComponent::new(processes)
+        .finalize(components::cooperative_component_static!(NUM_PROCS_H1));
+
+    // Layer-1 lockstep replay: core 1's console sits on top of a software-only
+    // UART (no hardware backing) that's fed by `dispatch_layer1_event` in the
+    // main loop below, rather than a real interrupt. See `Rp2350UartReplay`'s
+    // doc comment.
+    let uart_hooks_h1 = static_init!(Rp2350UartHooks, Rp2350UartHooks::new(&RP2350_TRANSPORT));
+    let lockstep_uart_h1 = static_init!(
+        LockstepUart<'static, rp2350::uart::Rp2350UartReplay, Rp2350UartHooks>,
+        LockstepUart::new(&rp2350::uart::CORE1_UART_REPLAY, uart_hooks_h1)
+    );
+    hil::uart::Receive::set_receive_client(&rp2350::uart::CORE1_UART_REPLAY, lockstep_uart_h1);
+    hil::uart::Transmit::set_transmit_client(&rp2350::uart::CORE1_UART_REPLAY, lockstep_uart_h1);
+
+    let memory_allocation_capability_h1 =
+        create_capability!(capabilities::MemoryAllocationCapability);
+    let tx_buf = static_init!(
+        [u8; capsules_core::console::DEFAULT_BUF_SIZE],
+        [0; capsules_core::console::DEFAULT_BUF_SIZE]
+    );
+    let rx_buf = static_init!(
+        [u8; capsules_core::console::DEFAULT_BUF_SIZE],
+        [0; capsules_core::console::DEFAULT_BUF_SIZE]
+    );
+    let console = static_init!(
+        capsules_core::console::Console<'static>,
+        capsules_core::console::Console::new(
+            lockstep_uart_h1,
+            tx_buf,
+            rx_buf,
+            board_kernel.create_grant(
+                capsules_core::console::DRIVER_NUM,
+                &memory_allocation_capability_h1
+            ),
+        )
+    );
+    hil::uart::Receive::set_receive_client(lockstep_uart_h1, console);
+    hil::uart::Transmit::set_transmit_client(lockstep_uart_h1, console);
+
+    // Layer-2: gate every console Command syscall behind a cross-core
+    // descriptor exchange. `core_id()` returns 1 at runtime here, so
+    // `LockstepDriver::command` branches to the shadow path.
+    let lockstep_console = static_init!(
+        LockstepDriver<'static, rp2350::lockstep::Rp2350Transport, capsules_core::console::Console<'static>>,
+        LockstepDriver::new(
+            &RP2350_TRANSPORT,
+            console,
+            capsules_core::console::DRIVER_NUM,
+            dispatch_layer1_event,
+        )
+    );
+
+    let upcall_verifier_h1 = static_init!(
+        Rp2350UpcallVerifier,
+        Rp2350UpcallVerifier::new(&UPCALL_REGISTRY)
+    );
+    board_kernel.register_upcall_verifier(upcall_verifier_h1);
+
+    let platform = Core1Platform { scheduler, lockstep_console };
+
+    extern "C" {
+        static _sapps: u8;
+        static _eapps: u8;
+        static mut _sappmem_h1: u8;
+        static _eappmem_h1: u8;
+    }
+
+    let process_management_capability =
+        create_capability!(capabilities::ProcessManagementCapability);
+    kernel::process::load_processes(
+        board_kernel,
+        chip,
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(_sapps),
+            core::ptr::addr_of!(_eapps) as usize - core::ptr::addr_of!(_sapps) as usize,
+        ),
+        core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(_sappmem_h1),
+            core::ptr::addr_of!(_eappmem_h1) as usize
+                - core::ptr::addr_of!(_sappmem_h1) as usize,
+        ),
+        &FAULT_RESPONSE,
+        &process_management_capability,
+    )
+    .unwrap_or_else(|_err| {
+        // No console on this core to report load errors to; core 0's own
+        // load_processes() call already reports failures for the shared app
+        // image, and Stage A only needs one core running it to compare
+        // fingerprints against a divergence.
+    });
+
+    // SCRATCH DIAGNOSTIC
+    CORE1_STAGE.store(3, core::sync::atomic::Ordering::Relaxed);
+
+    let mut round: u32 = 0;
+
+    // No outer per-round Sync barrier: core 0 often needs extra rounds of
+    // real kernel work (interrupt servicing) that core 1, immune to those
+    // peripherals, never experiences, so forcing a round-for-round
+    // rendezvous here was fighting the two cores' natural pace instead of
+    // verifying anything meaningful. The only cross-core synchronization
+    // left is: (1) Layer 1's opportunistic, non-blocking event drain below,
+    // and (2) Layer 2's per-syscall gate in `LockstepDriver::command`
+    // (`libraries/lockstep/src/lib.rs`), which is where real divergence
+    // detection now lives -- it spin-waits (bounded, fail-stop on timeout)
+    // for the leader's descriptor rather than assuming "not here yet" means
+    // "never coming."
+    loop {
+        round += 1;
+        CORE1_ROUND.store(round, core::sync::atomic::Ordering::Relaxed);
+
+        // Opportunistically drain and dispatch whatever's already on the
+        // channel -- non-blocking, no rendezvous. UartRxReady/UartTxDone
+        // replay immediately; SyscallDesc queues via store_pending_syscall
+        // for LockstepDriver::command's shadow branch to pick up when this
+        // core's own process reaches the matching syscall.
+        while let Some(entry) = RP2350_TRANSPORT.try_pop() {
+            dispatch_layer1_event(entry);
+            CORE1_L1_EVENT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+
+        let _ = board_kernel.kernel_loop_operation(
+            &platform,
+            chip,
+            None::<&kernel::ipc::IPC<{ NUM_PROCS_H1 as u8 }>>,
+            true, // no_sleep: core 1 has no interrupt-driven wake configured
+            &main_loop_capability,
+        );
+        // Drain any TX-done event that arrived on the channel before the
+        // process called transmit_buffer.
+        rp2350::uart::replay_pending_tx_done_for_core1();
+
+        core::hint::spin_loop();
+    }
+}
 
 fn init_clocks(
     peripherals: &Rp2350DefaultPeripherals,
@@ -289,6 +620,18 @@ pub unsafe fn main() {
             .deactivate_pads();
     }
 
+    // Launch core 1 straight into `core1_entry`, which immediately blocks on
+    // the boot handshake (see below) until this core finishes load_processes().
+    {
+        extern "C" {
+            static _estack_h1: u8;
+        }
+        let sp = core::ptr::addr_of!(_estack_h1) as u32;
+        let vtor = core::ptr::addr_of!(BASE_VECTORS) as u32;
+        let entry = core1_entry as *const () as u32;
+        peripherals.sio.launch_core1(vtor, sp, entry);
+    }
+
     let chip = static_init!(
         Rp2350<Rp2350DefaultPeripherals>,
         Rp2350::new(peripherals, &peripherals.sio)
@@ -320,7 +663,19 @@ pub unsafe fn main() {
     )
     .finalize(components::alarm_component_static!(RPTimer));
 
-    let uart_mux = components::console::UartMuxComponent::new(&peripherals.uart0, 115200)
+    // Layer-1 lockstep replay: interpose LockstepUart between the real UART
+    // and the mux so every TX/RX completion forwards to core 1 before
+    // reaching the console/process-console capsules. See `core1_entry`'s
+    // console wiring for the replay side.
+    let uart_hooks = static_init!(Rp2350UartHooks, Rp2350UartHooks::new(&RP2350_TRANSPORT));
+    let lockstep_uart = static_init!(
+        LockstepUart<'static, rp2350::uart::Uart<'static>, Rp2350UartHooks>,
+        LockstepUart::new(&peripherals.uart0, uart_hooks)
+    );
+    hil::uart::Receive::set_receive_client(&peripherals.uart0, lockstep_uart);
+    hil::uart::Transmit::set_transmit_client(&peripherals.uart0, lockstep_uart);
+
+    let uart_mux = components::console::UartMuxComponent::new(lockstep_uart, 115200)
         .finalize(components::uart_mux_component_static!());
 
     // Setup the console.
@@ -330,6 +685,26 @@ pub unsafe fn main() {
         uart_mux,
     )
     .finalize(components::console_component_static!());
+
+    // Layer-2: gate every console Command syscall behind a cross-core
+    // descriptor exchange. `core_id()` returns 0 at runtime here, so
+    // `LockstepDriver::command` branches to the leader path (push, kick,
+    // block until core 1 echoes the descriptor back, before emitting).
+    let lockstep_console = static_init!(
+        LockstepDriver<'static, rp2350::lockstep::Rp2350Transport, capsules_core::console::Console<'static>>,
+        LockstepDriver::new(
+            &RP2350_TRANSPORT,
+            console,
+            capsules_core::console::DRIVER_NUM,
+            dispatch_layer1_event,
+        )
+    );
+
+    let upcall_verifier = static_init!(
+        Rp2350UpcallVerifier,
+        Rp2350UpcallVerifier::new(&UPCALL_REGISTRY)
+    );
+    board_kernel.register_upcall_verifier(upcall_verifier);
 
     let gpio = GpioComponent::new(
         board_kernel,
@@ -403,8 +778,8 @@ pub unsafe fn main() {
     .finalize(components::process_console_component_static!(RPTimer));
     let _ = process_console.start();
 
-    let scheduler = components::sched::round_robin::RoundRobinComponent::new(processes)
-        .finalize(components::round_robin_component_static!(NUM_PROCS));
+    let scheduler = components::sched::cooperative::CooperativeComponent::new(processes)
+        .finalize(components::cooperative_component_static!(NUM_PROCS));
 
     let raspberry_pi_pico = RaspberryPiPico2 {
         ipc: kernel::ipc::IPC::new(
@@ -412,12 +787,11 @@ pub unsafe fn main() {
             kernel::ipc::DRIVER_NUM,
             &memory_allocation_capability,
         ),
-        console,
+        lockstep_console,
         alarm,
         gpio,
         led,
         scheduler,
-        systick: cortexm33::systick::SysTick::new_with_calibration(125_000_000),
     };
 
     kernel::debug!("Initialization complete. Enter main loop");
@@ -455,10 +829,47 @@ pub unsafe fn main() {
 
     let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
 
-    board_kernel.kernel_loop(
-        &raspberry_pi_pico,
-        chip,
-        Some(&raspberry_pi_pico.ipc),
-        &main_loop_capability,
-    );
+    // Boot handshake: send the one-time init Sync and wait for core 1's
+    // echo. Must happen after load_processes() so core 0's own process state
+    // is fully set up before lockstep iteration begins. See `core1_entry`'s
+    // matching call.
+    lockstep_barrier(&RP2350_TRANSPORT, SyncEntry::Sync { fingerprint: 0 }, |_| {});
+    kernel::debug!("Lockstep: init sync complete");
+
+    // Drain any interrupts/deferred calls left over from peripheral
+    // initialization (UART, GPIO, alarm mux setup) to avoid a spurious
+    // one-round divergence at boot.
+    board_kernel.kernel_preloop_operation(&raspberry_pi_pico, chip, &main_loop_capability);
+
+    kernel::debug!("Entering main loop.");
+
+    // No outer per-round Sync barrier on this side either -- see the
+    // matching comment in `core1_entry`. Real divergence detection now lives
+    // entirely in Layer 2's per-syscall gate (`LockstepDriver::command`).
+    //
+    // SCRATCH DIAGNOSTIC (fail-stop verification, remove once stable):
+    // report core 1's progress (written to CORE1_STAGE/CORE1_ROUND via plain
+    // atomics) periodically, from core 0's own already-safe kernel::debug!
+    // path.
+    let mut round0: u32 = 0;
+
+    loop {
+        let _ = board_kernel.kernel_loop_operation(
+            &raspberry_pi_pico,
+            chip,
+            Some(&raspberry_pi_pico.ipc),
+            false,
+            &main_loop_capability,
+        );
+
+        round0 += 1;
+        if round0 <= 5 || round0 % 200 == 0 {
+            kernel::debug!(
+                "[core0] round0={} core1_stage={} core1_round={}",
+                round0,
+                CORE1_STAGE.load(core::sync::atomic::Ordering::Relaxed),
+                CORE1_ROUND.load(core::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    }
 }
