@@ -16,8 +16,9 @@ use kernel::upcall::UpcallId;
 // ---------------------------------------------------------------------------
 
 pub use lockstep::{
-    lockstep_barrier, store_pending_syscall, BulkTag, DriverUpcallRules, LockstepDriver,
-    LockstepUart, SyncEntry, SyscallDesc, Transport, UartHooks, UpcallMode, UpcallRule,
+    gate_stats, lockstep_barrier, store_pending_syscall, store_pending_upcall, verify_upcall,
+    BulkTag, DriverUpcallRules, GateStats, LockstepDriver, LockstepUart, SyncEntry, SyscallDesc,
+    Transport, UartHooks, UpcallDesc, UpcallMode, UpcallRule,
 };
 
 // ---------------------------------------------------------------------------
@@ -121,25 +122,29 @@ pub fn dispatch_layer1_event(entry: SyncEntry) {
         SyncEntry::UartRxReady { len } => crate::uart::replay_rx_done_for_hart1(len),
         SyncEntry::UartTxDone => crate::uart::replay_tx_done_for_hart1(),
         SyncEntry::SyscallDesc(desc) => store_pending_syscall(desc),
-        SyncEntry::Sync { .. } | SyncEntry::UpcallDesc { .. } => {
+        SyncEntry::UpcallDesc(desc) => store_pending_upcall(desc),
+        SyncEntry::Sync { .. } => {
             unreachable!("lockstep_barrier descriptors must not be dispatched as Layer-1 events")
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// QemuUpcallVerifier — Layer-3 upcall verification (stub; TODO stage 3)
+// QemuUpcallVerifier — Layer-2 upcall verification
 // ---------------------------------------------------------------------------
 
 /// Lockstep upcall verifier for the QEMU dual-hart configuration.
+///
+/// Looks up the registered rule for the incoming `(driver_num,
+/// subscribe_num)` and, if one exists, delegates the cross-hart exchange to
+/// [`verify_upcall`].
 pub struct QemuUpcallVerifier {
-    hart_id: u32,
     registry: &'static [DriverUpcallRules],
 }
 
 impl QemuUpcallVerifier {
     pub fn new(registry: &'static [DriverUpcallRules]) -> Self {
-        Self { hart_id: crate::chip::current_hart(), registry }
+        Self { registry }
     }
 }
 
@@ -156,9 +161,7 @@ impl UpcallVerifier for QemuUpcallVerifier {
             None => return UpcallAction::Proceed,
         };
 
-        // TODO(lockstep-stage3): cross-hart channel exchange via lockstep_barrier.
-        let _ = (rule, r0, r1, r2, self.hart_id);
-        UpcallAction::Proceed
+        verify_upcall(&QEMU_TRANSPORT, dispatch_layer1_event, id.driver_num as u32, rule, r0, r1, r2)
     }
 }
 

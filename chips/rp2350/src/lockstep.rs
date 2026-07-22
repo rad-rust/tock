@@ -32,8 +32,9 @@ use crate::chip::Processor;
 use crate::gpio::SIO;
 
 pub use lockstep::{
-    lockstep_barrier, store_pending_syscall, BulkTag, DriverUpcallRules, LockstepDriver,
-    LockstepUart, SyncEntry, SyscallDesc, Transport, UartHooks, UpcallMode, UpcallRule,
+    gate_stats, lockstep_barrier, store_pending_syscall, store_pending_upcall, verify_upcall,
+    BulkTag, DriverUpcallRules, GateStats, LockstepDriver, LockstepUart, SyncEntry, SyscallDesc,
+    Transport, UartHooks, UpcallDesc, UpcallMode, UpcallRule,
 };
 
 // ---------------------------------------------------------------------------
@@ -179,7 +180,8 @@ pub fn dispatch_layer1_event(entry: SyncEntry) {
         SyncEntry::UartRxReady { len } => crate::uart::replay_rx_done_for_core1(len),
         SyncEntry::UartTxDone => crate::uart::replay_tx_done_for_core1(),
         SyncEntry::SyscallDesc(desc) => store_pending_syscall(desc),
-        SyncEntry::Sync { .. } | SyncEntry::UpcallDesc { .. } => {
+        SyncEntry::UpcallDesc(desc) => store_pending_upcall(desc),
+        SyncEntry::Sync { .. } => {
             unreachable!("lockstep_barrier descriptors must not be dispatched as Layer-1 events")
         }
     }
@@ -234,23 +236,21 @@ impl UartHooks for Rp2350UartHooks {
 }
 
 // ---------------------------------------------------------------------------
-// Rp2350UpcallVerifier — Layer-2 upcall verification (stub; TODO stage 3)
+// Rp2350UpcallVerifier — Layer-2 upcall verification
 // ---------------------------------------------------------------------------
 
 /// Lockstep upcall verifier for the RP2350 dual-core configuration.
 ///
-/// Mirrors `QemuUpcallVerifier`: the registry/rule lookup is live, but the
-/// actual cross-core exchange of masked upcall arguments (via
-/// `lockstep_barrier` and `SyncEntry::UpcallDesc`) is not wired up yet --
-/// same deferred scope as the QEMU port's own "stage3" TODO.
+/// Looks up the registered rule for the incoming `(driver_num,
+/// subscribe_num)` and, if one exists, delegates the cross-core exchange to
+/// [`verify_upcall`].
 pub struct Rp2350UpcallVerifier {
-    core_id: u8,
     registry: &'static [DriverUpcallRules],
 }
 
 impl Rp2350UpcallVerifier {
     pub fn new(registry: &'static [DriverUpcallRules]) -> Self {
-        Self { core_id: RP2350_TRANSPORT.core_id(), registry }
+        Self { registry }
     }
 }
 
@@ -273,8 +273,14 @@ impl kernel::platform::UpcallVerifier for Rp2350UpcallVerifier {
             None => return kernel::platform::UpcallAction::Proceed,
         };
 
-        // TODO(lockstep-stage3): cross-core channel exchange via lockstep_barrier.
-        let _ = (rule, r0, r1, r2, self.core_id);
-        kernel::platform::UpcallAction::Proceed
+        verify_upcall(
+            &RP2350_TRANSPORT,
+            dispatch_layer1_event,
+            id.driver_num as u32,
+            rule,
+            r0,
+            r1,
+            r2,
+        )
     }
 }

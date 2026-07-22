@@ -81,9 +81,7 @@ const NUM_PROCS: usize = 4;
 //
 // Mirrors qemu_rv32_virt_lib's CONSOLE_UPCALL_RULES/UPCALL_REGISTRY exactly --
 // console driver_num/subscribe_num semantics are capsule-level, not
-// chip-specific. `Rp2350UpcallVerifier::on_upcall` doesn't yet act on these
-// (see its doc comment), but the registry itself is live and shared by both
-// cores' verifiers.
+// chip-specific.
 static CONSOLE_UPCALL_RULES: [UpcallRule; 2] = [
     UpcallRule {
         subscribe_num: 1, // subscribe_num 1 = WRITE_DONE in capsules_core::console
@@ -847,12 +845,17 @@ pub unsafe fn main() {
     // matching comment in `core1_entry`. Real divergence detection now lives
     // entirely in Layer 2's per-syscall gate (`LockstepDriver::command`).
     //
-    // SCRATCH DIAGNOSTIC (fail-stop verification, remove once stable):
-    // report core 1's progress (written to CORE1_STAGE/CORE1_ROUND via plain
-    // atomics) periodically, from core 0's own already-safe kernel::debug!
-    // path.
-    let mut round0: u32 = 0;
-
+    // Deliberately no periodic kernel::debug! print here: io::WRITER and the
+    // app's Console driver share the same physical peripherals.uart0
+    // instance with no coordination -- io::WRITER writes via send_byte()
+    // (direct register pokes, bypassing tx_status/tx_position/tx_len
+    // bookkeeping entirely), while Console is interrupt-driven and stateful.
+    // A debug! print landing mid-transmission (e.g. during a multi-chunk
+    // write spanning several interrupt rounds) can interleave bytes into the
+    // hardware FIFO out from under the app's state machine, permanently
+    // desyncing it -- this manifested as a stuck-forever UART0_IRQ that
+    // starved continue_process() (kernel/src/scheduler.rs) for every process
+    // on this core, not just the one that happened to be transmitting.
     loop {
         let _ = board_kernel.kernel_loop_operation(
             &raspberry_pi_pico,
@@ -861,15 +864,5 @@ pub unsafe fn main() {
             false,
             &main_loop_capability,
         );
-
-        round0 += 1;
-        if round0 <= 5 || round0 % 200 == 0 {
-            kernel::debug!(
-                "[core0] round0={} core1_stage={} core1_round={}",
-                round0,
-                CORE1_STAGE.load(core::sync::atomic::Ordering::Relaxed),
-                CORE1_ROUND.load(core::sync::atomic::Ordering::Relaxed),
-            );
-        }
     }
 }

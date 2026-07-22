@@ -448,7 +448,14 @@ impl<'a> Uart<'a> {
         if self.registers.uartimsc.is_set(UARTIMSC::TXIM) {
             if self.registers.uartfr.is_set(UARTFR::TXFE) {
                 if self.tx_status.get() == UARTStateTX::Idle {
-                    // no-op to prevent a hang
+                    // Spurious/stale TX interrupt (TXIM left enabled with
+                    // nothing in progress) -- TXIM && TXFE is level-triggered,
+                    // so leaving TXIM enabled here would make this interrupt
+                    // pending forever, permanently starving process dispatch
+                    // via continue_process()'s has_pending_interrupts() check
+                    // (kernel/src/scheduler.rs). Disable it to actually
+                    // quiesce, not just skip processing it once.
+                    self.disable_transmit_interrupt();
                 } else if self.tx_status.get() == UARTStateTX::Transmitting {
                     self.disable_transmit_interrupt();
                     if self.tx_position.get() < self.tx_len.get() {

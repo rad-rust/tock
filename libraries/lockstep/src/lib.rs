@@ -109,23 +109,33 @@ pub enum SyncEntry {
     /// See [`LockstepDriver`] and [`store_pending_syscall`].
     SyscallDesc(SyscallDesc),
 
-    /// Layer-2 upcall descriptor: both cores exchange this at each intercepted
-    /// upcall boundary to verify argument equivalence before delivering the
+    /// Layer-2 upcall descriptor: the leader pushes this at each intercepted
+    /// upcall boundary; the shadow stores it via [`store_pending_upcall`] and
+    /// consumes it in [`verify_upcall`] to verify argument equivalence (or
+    /// substitute the leader's authoritative values) before delivering the
     /// upcall to userspace.
-    ///
-    /// `driver_num` / `subscribe_num` identify the upcall; `r0`–`r2` carry the
-    /// masked argument values to compare (unmasked fields are zeroed).
     ///
     /// Note: at ~20 bytes this is wider than the 32-bit RP2350 SIO FIFO entry
     /// the channel models. Acceptable on a software channel (QEMU); a faithful
     /// RP2350 port requires word-packing or a shared-SRAM payload slot.
-    UpcallDesc {
-        driver_num: u32,
-        subscribe_num: u8,
-        r0: u32,
-        r1: u32,
-        r2: u32,
-    },
+    UpcallDesc(UpcallDesc),
+}
+
+/// Payload of a Layer-2 upcall descriptor exchanged between cores.
+///
+/// Extracted from [`SyncEntry::UpcallDesc`] so it can be stored in the
+/// shadow's pending queue ([`PENDING_UPCALLS_SHADOW`]), mirroring
+/// [`SyscallDesc`]/[`PENDING_SYSCALLS_SHADOW`].
+///
+/// `r0`–`r2` carry the masked argument values per the [`UpcallRule`] that
+/// triggered the exchange; unmasked fields are zeroed.
+#[derive(Clone, Copy)]
+pub struct UpcallDesc {
+    pub driver_num: u32,
+    pub subscribe_num: u8,
+    pub r0: u32,
+    pub r1: u32,
+    pub r2: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +265,7 @@ pub fn lockstep_barrier<T: Transport>(
         }
         if let Some(e) = transport.try_pop() {
             match e {
-                SyncEntry::Sync { .. } | SyncEntry::UpcallDesc { .. } => return e,
+                SyncEntry::Sync { .. } | SyncEntry::UpcallDesc(_) => return e,
                 other => dispatch(other),
             }
         }
@@ -297,6 +307,87 @@ pub fn store_pending_syscall(desc: SyscallDesc) {
 /// Phase 2 on the shadow core.
 pub(crate) fn take_pending_syscall() -> Option<SyscallDesc> {
     PENDING_SYSCALLS_SHADOW.pop()
+}
+
+// ---------------------------------------------------------------------------
+// Pending upcall queue (shadow side)
+// ---------------------------------------------------------------------------
+
+/// SPSC queue of [`UpcallDesc`] entries buffered for [`verify_upcall`],
+/// mirroring [`PENDING_SYSCALLS_SHADOW`].
+///
+/// Producer: the board's background Layer-1 drain, via `dispatch_layer1_event`
+/// calling [`store_pending_upcall`].
+/// Consumer: [`verify_upcall`] on the shadow core.
+///
+/// Both run on the shadow core sequentially (the background drain cannot run
+/// while nested inside `do_process` → `verify_upcall`), so there is no
+/// concurrent access — the SPSC invariant holds trivially.
+static PENDING_UPCALLS_SHADOW: SpscChannel<4, UpcallDesc> = SpscChannel::new();
+
+/// Enqueue an [`UpcallDesc`] received from the leader for comparison in
+/// [`verify_upcall`]. Called by the board's Layer-1 drain loop (or
+/// `dispatch_layer1_event`).
+pub fn store_pending_upcall(desc: UpcallDesc) {
+    while !PENDING_UPCALLS_SHADOW.push(desc) {
+        core::hint::spin_loop();
+    }
+}
+
+/// Dequeue the next pending [`UpcallDesc`]. Called by [`verify_upcall`] on
+/// the shadow core.
+pub(crate) fn take_pending_upcall() -> Option<UpcallDesc> {
+    PENDING_UPCALLS_SHADOW.pop()
+}
+
+// ---------------------------------------------------------------------------
+// Gate-latency stats (leader side) — benchmarking instrumentation
+// ---------------------------------------------------------------------------
+
+/// Running stats for the leader's Layer-2 syscall-gate wait (push descriptor
+/// → shadow confirmation), in [`Transport::now_ticks`] units.
+///
+/// Leader-only: the shadow never blocks on its own echo, so it has nothing
+/// analogous to record. Updated on every [`LockstepDriver::command`] call on
+/// the leader core; read via [`gate_stats`] -- e.g. by the board's main loop
+/// for periodic benchmark reporting, deliberately *not* printed on every
+/// call, since printing is itself a gated syscall and would perturb the very
+/// latency being measured.
+///
+/// Plain [`AtomicU32`]s rather than a lock: the leader core is the sole
+/// writer (single-threaded from its own perspective, `command` is not
+/// reentrant), and a reader racing an in-progress update at worst observes a
+/// slightly stale snapshot -- acceptable for periodic diagnostics.
+static GATE_WAIT_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static GATE_WAIT_SUM_TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static GATE_WAIT_MAX_TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn record_gate_wait(ticks: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    GATE_WAIT_COUNT.fetch_add(1, Relaxed);
+    GATE_WAIT_SUM_TICKS.fetch_add(ticks, Relaxed);
+    GATE_WAIT_MAX_TICKS.fetch_max(ticks, Relaxed);
+}
+
+/// Snapshot of the leader's Layer-2 syscall-gate wait stats. See
+/// [`gate_stats`].
+#[derive(Clone, Copy)]
+pub struct GateStats {
+    pub count: u32,
+    pub sum_ticks: u32,
+    pub max_ticks: u32,
+}
+
+/// Read the current gate-wait stats. `sum_ticks / count` gives the mean
+/// wait; `max_ticks` gives the observed worst case. Counters accumulate for
+/// the process lifetime and are never reset.
+pub fn gate_stats() -> GateStats {
+    use core::sync::atomic::Ordering::Relaxed;
+    GateStats {
+        count: GATE_WAIT_COUNT.load(Relaxed),
+        sum_ticks: GATE_WAIT_SUM_TICKS.load(Relaxed),
+        max_ticks: GATE_WAIT_MAX_TICKS.load(Relaxed),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,19 +451,6 @@ impl<T: Transport, D: kernel::syscall::SyscallDriver + kernel::syscall::Lockstep
         };
 
         if self.transport.core_id() == 0 {
-            // SCRATCH DIAGNOSTIC (fail-stop / gate-round debugging): safe to
-            // print unconditionally -- kernel::debug!() is thread-bound to
-            // whichever core registered the debug writer (core 0 only on
-            // both qemu_rv32_virt and rp2350), so this silently no-ops if
-            // ever reached from the shadow core.
-            kernel::debug!(
-                "[leader gate] driver={} sub={} a0={:#x} a1={:#x} fp={:#010x}",
-                desc.driver_num,
-                desc.sub,
-                desc.arg0,
-                desc.arg1,
-                desc.payload_fp,
-            );
             // Leader path: push descriptor, kick shadow, then block until
             // the shadow echoes the same descriptor back (before-emit gate).
             while !self.transport.try_push(SyncEntry::SyscallDesc(desc)) {
@@ -407,6 +485,9 @@ impl<T: Transport, D: kernel::syscall::SyscallDriver + kernel::syscall::Lockstep
                                 desc.payload_fp,
                             );
                         }
+                        record_gate_wait(
+                            self.transport.now_ticks().wrapping_sub(start),
+                        );
                         break;
                     }
                     Some(_unexpected) => panic!(
@@ -526,6 +607,162 @@ pub struct DriverUpcallRules {
     pub driver_num: usize,
     /// Rules for each subscribe slot that needs cross-core verification.
     pub rules: &'static [UpcallRule],
+}
+
+// ---------------------------------------------------------------------------
+// verify_upcall — Layer-2 upcall verification
+// ---------------------------------------------------------------------------
+
+/// Verify (or forward) a single intercepted upcall's masked arguments across
+/// cores, per `rule`. Called by each board's `UpcallVerifier::on_upcall` once
+/// a registered rule has been matched for the incoming `(driver_num,
+/// subscribe_num)`.
+///
+/// - **Leader (core 0)**: pushes a masked descriptor to the transport, kicks
+///   the shadow, then blocks (bounded by [`Transport::SYNC_TIMEOUT_TICKS`])
+///   until the shadow acknowledges it -- mirroring [`LockstepDriver::command`]'s
+///   before-emit gate. This is necessary even though delivering an upcall has
+///   no external side effect to protect: unlike syscalls, which the
+///   synchronous syscall ABI limits to one outstanding per app, a process can
+///   have arbitrarily many queued upcalls for the same driver/subscribe slot.
+///   A non-blocking leader can race arbitrarily far ahead queueing them, and
+///   once that backlog exceeds the transport's depth the shadow's FIFO-match
+///   wait can never catch up -- capping outstanding upcalls at one in flight
+///   is what keeps the wait bounded.
+/// - **Shadow (core 1)**: the leader may not have reached this upcall yet
+///   (interrupt-preemption asymmetry, same as [`LockstepDriver::command`]), so
+///   it spin-waits (bounded) for the matching descriptor -- first checking
+///   [`PENDING_UPCALLS_SHADOW`] (filled by the board's background Layer-1
+///   drain via [`store_pending_upcall`]), then polling the transport
+///   directly, dispatching any other entries encountered via `dispatch`.
+///   [`UpcallMode::Compare`] rules panic on a masked-field mismatch;
+///   [`UpcallMode::Forward`] rules return [`UpcallAction::Overwrite`]
+///   substituting the leader's masked values. Either way it echoes its own
+///   masked descriptor back so the leader's wait above can unblock.
+pub fn verify_upcall<T: Transport>(
+    transport: &T,
+    dispatch: fn(SyncEntry),
+    driver_num: u32,
+    rule: &UpcallRule,
+    r0: usize,
+    r1: usize,
+    r2: usize,
+) -> kernel::platform::UpcallAction {
+    use kernel::platform::UpcallAction;
+
+    let mask = |present: bool, v: usize| if present { v as u32 } else { 0 };
+    let masked = UpcallDesc {
+        driver_num,
+        subscribe_num: rule.subscribe_num as u8,
+        r0: mask(rule.mask.0, r0),
+        r1: mask(rule.mask.1, r1),
+        r2: mask(rule.mask.2, r2),
+    };
+
+    if transport.core_id() == 0 {
+        while !transport.try_push(SyncEntry::UpcallDesc(masked)) {
+            core::hint::spin_loop();
+        }
+        transport.kick_peer();
+
+        let start = transport.now_ticks();
+        loop {
+            match transport.try_pop() {
+                Some(SyncEntry::UpcallDesc(d))
+                    if d.driver_num == driver_num && d.subscribe_num == rule.subscribe_num as u8 =>
+                {
+                    break;
+                }
+                Some(other) => dispatch(other),
+                None => {}
+            }
+            if transport.now_ticks().wrapping_sub(start) >= T::SYNC_TIMEOUT_TICKS {
+                panic!(
+                    "Lockstep Layer-2: leader upcall driver {} sub {} timed out waiting \
+                     for shadow acknowledgement (shadow diverged or hung?)",
+                    driver_num, rule.subscribe_num,
+                );
+            }
+            transport.on_spin();
+            core::hint::spin_loop();
+        }
+        return UpcallAction::Proceed;
+    }
+
+    let start = transport.now_ticks();
+    let leader = loop {
+        if let Some(d) = take_pending_upcall() {
+            break d;
+        }
+        if let Some(entry) = transport.try_pop() {
+            match entry {
+                SyncEntry::UpcallDesc(d) => break d,
+                other => dispatch(other),
+            }
+        }
+        if transport.now_ticks().wrapping_sub(start) >= T::SYNC_TIMEOUT_TICKS {
+            panic!(
+                "Lockstep Layer-2: shadow upcall driver {} sub {} timed out waiting \
+                 for leader descriptor (leader diverged or hung?)",
+                driver_num, rule.subscribe_num,
+            );
+        }
+        transport.on_spin();
+        core::hint::spin_loop();
+    };
+
+    if leader.driver_num != driver_num || leader.subscribe_num != rule.subscribe_num as u8 {
+        panic!(
+            "Lockstep Layer-2: upcall identity mismatch: \
+             leader=(driver={},sub={}) shadow=(driver={},sub={})",
+            leader.driver_num, leader.subscribe_num, driver_num, rule.subscribe_num,
+        );
+    }
+
+    let result = match rule.mode {
+        UpcallMode::Compare => {
+            if leader.r0 != masked.r0 || leader.r1 != masked.r1 || leader.r2 != masked.r2 {
+                panic!(
+                    "Lockstep Layer-2: upcall arg mismatch driver {} sub {}: \
+                     leader=(r0={:#x},r1={:#x},r2={:#x}) shadow=(r0={:#x},r1={:#x},r2={:#x})",
+                    driver_num,
+                    rule.subscribe_num,
+                    leader.r0,
+                    leader.r1,
+                    leader.r2,
+                    masked.r0,
+                    masked.r1,
+                    masked.r2,
+                );
+            }
+            UpcallAction::Proceed
+        }
+        UpcallMode::Forward => {
+            let pick = |present: bool, leader_v: u32, own: usize| {
+                if present {
+                    leader_v as usize
+                } else {
+                    own
+                }
+            };
+            UpcallAction::Overwrite {
+                r0: pick(rule.mask.0, leader.r0, r0),
+                r1: pick(rule.mask.1, leader.r1, r1),
+                r2: pick(rule.mask.2, leader.r2, r2),
+            }
+        }
+    };
+
+    // Echo our own masked descriptor back as acknowledgement -- the leader
+    // is spin-polling try_pop, so no kick needed. Note this is *not* the
+    // same as agreeing on values: Forward-mode fields are allowed to differ
+    // by design (e.g. a live timestamp), so the leader only checks identity
+    // on the entry it receives here, not full equality.
+    while !transport.try_push(SyncEntry::UpcallDesc(masked)) {
+        core::hint::spin_loop();
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------

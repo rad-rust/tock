@@ -193,18 +193,45 @@ pub unsafe extern "C" fn main_secondary() -> ! {
                         break;
                     }
                     SyncEntry::SyscallDesc(desc) => {
-                        use qemu_rv32_virt_chip::lockstep::store_pending_syscall;
+                        use qemu_rv32_virt_chip::lockstep::{
+                            store_pending_syscall, store_pending_upcall,
+                        };
                         store_pending_syscall(desc);
                         // Drain any remaining entries (e.g. UartTxDone that
                         // arrived in the same kick) before running the process.
                         while let Some(e) = QEMU_TRANSPORT.try_pop() {
                             match e {
                                 SyncEntry::SyscallDesc(d) => store_pending_syscall(d),
+                                SyncEntry::UpcallDesc(d) => store_pending_upcall(d),
                                 other => dispatch_layer1_event(other),
                             }
                         }
                         is_gate_round = true;
                         h0_fp_from_drain = 0; // filled in after Phase 2
+                        break;
+                    }
+                    SyncEntry::UpcallDesc(desc) => {
+                        // Same gate-round treatment as SyscallDesc: hart 0's
+                        // leader-side verify_upcall() now blocks for hart 1's
+                        // acknowledgement (see libraries/lockstep/src/lib.rs),
+                        // so hart 1 must reach Phase 2 -- where its own
+                        // on_upcall()/verify_upcall() call can fire and echo
+                        // back -- instead of continuing to drain and waiting
+                        // for a Sync that hart 0 won't send until it's
+                        // unblocked.
+                        use qemu_rv32_virt_chip::lockstep::{
+                            store_pending_syscall, store_pending_upcall,
+                        };
+                        store_pending_upcall(desc);
+                        while let Some(e) = QEMU_TRANSPORT.try_pop() {
+                            match e {
+                                SyncEntry::SyscallDesc(d) => store_pending_syscall(d),
+                                SyncEntry::UpcallDesc(d) => store_pending_upcall(d),
+                                other => dispatch_layer1_event(other),
+                            }
+                        }
+                        is_gate_round = true;
+                        h0_fp_from_drain = 0;
                         break;
                     }
                     other => {
