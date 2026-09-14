@@ -9,6 +9,7 @@
 
 pub mod chip;
 pub mod clocks;
+pub mod flash;
 pub mod gpio;
 pub mod interrupts;
 pub mod lockstep;

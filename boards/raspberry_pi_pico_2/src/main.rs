@@ -235,6 +235,90 @@ static CORE1_ROUND: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 /// reliably flushes even when triggered from core 1 (see the comment above).
 static CORE1_L1_EVENT_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+// ---------------------------------------------------------------------------
+// Flash-write benchmark, Stage 2b: core-1 parking handshake.
+// ---------------------------------------------------------------------------
+//
+// Both cores share one physical external flash chip over one QSPI bus, so a
+// real flash erase/program (Stage 2c) must pause XIP chip-wide -- neither
+// core may fetch instructions from flash during that window. Core 1 must be
+// parked in RAM-resident code for the whole window; this handshake gets it
+// there and back safely, entirely decoupled from the lockstep BiChannel/SIO
+// FIFO doorbell (which pico-sdk's own multicore_lockout reuses and which we
+// deliberately avoid contending with).
+
+/// Set by core 0 to ask core 1 to park in RAM-resident code; cleared by core
+/// 0 to release it. Core 0 must not pause XIP until it has observed
+/// `FLASH_PARK_ACK`, and must not assume core 1 has resumed until it clears
+/// again after `FLASH_PARK_REQUEST` is cleared.
+static FLASH_PARK_REQUEST: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Set by core 1 once it has actually reached the RAM-resident park loop
+/// (not merely observed the request) -- core 1 might still be mid-fetch
+/// from flash-resident code otherwise. Cleared by core 1 just before it
+/// returns to its normal loop.
+static FLASH_PARK_ACK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Number of `u32` words in `CORE1_PARK_BUF`. Must be a power of two: the
+/// `.ramfunc` park loop indexes it with a plain bitwise AND rather than a
+/// bounds-checked array index, since a failed bounds check would branch
+/// into the (flash-resident) panic handler while XIP may be paused
+/// chip-wide.
+const CORE1_PARK_BUF_LEN: usize = 64;
+
+struct Core1ParkBuf(core::cell::UnsafeCell<[u32; CORE1_PARK_BUF_LEN]>);
+// SAFETY: only core 1 ever touches this buffer, and only from within
+// `core1_flash_park_loop` (core 0 never reads or writes it).
+unsafe impl Sync for Core1ParkBuf {}
+
+/// Core 1's own scratch RAM buffer, written continuously while parked -- so
+/// core 1 stays genuinely active (real RAM-write traffic) during a flash
+/// op, rather than sitting fully idle.
+static CORE1_PARK_BUF: Core1ParkBuf = Core1ParkBuf(core::cell::UnsafeCell::new(
+    [0u32; CORE1_PARK_BUF_LEN],
+));
+
+/// Core 1's RAM-resident park loop. Entered from `core1_entry`'s main loop
+/// instead of a normal iteration whenever `FLASH_PARK_REQUEST` is set; spins
+/// writing to `CORE1_PARK_BUF` until released.
+///
+/// # Safety
+/// Must only be called from `core1_entry`'s loop, and only core 1 may call
+/// it. Every operation in this function must stay RAM-resident (no calls to
+/// non-`.ramfunc` code, no panicking paths) for as long as core 0 may have
+/// flash's XIP paused chip-wide.
+///
+/// `#[inline(never)]` is load-bearing, not just a hint: `link_section` only
+/// controls where this function's *own* symbol is placed -- if the
+/// optimizer inlined it away, its code would merge into the (flash-resident)
+/// caller instead, silently defeating the whole point.
+#[inline(never)]
+#[unsafe(link_section = ".ramfunc")]
+unsafe fn core1_flash_park_loop() {
+    use core::sync::atomic::Ordering;
+
+    FLASH_PARK_ACK.store(true, Ordering::Release);
+
+    let buf_ptr = CORE1_PARK_BUF.0.get() as *mut u32;
+    let mut i: u32 = 0;
+    while FLASH_PARK_REQUEST.load(Ordering::Acquire) {
+        // SAFETY: `buf_ptr` is valid for `CORE1_PARK_BUF_LEN` u32 writes;
+        // `& (CORE1_PARK_BUF_LEN - 1)` keeps the offset in range without a
+        // bounds-checked index (see `CORE1_PARK_BUF_LEN`'s doc comment).
+        // write_volatile (not a plain store) so this can't be optimized away
+        // as dead code -- the point is real RAM-write traffic while parked.
+        unsafe {
+            buf_ptr
+                .add((i as usize) & (CORE1_PARK_BUF_LEN - 1))
+                .write_volatile(i);
+        }
+        i = i.wrapping_add(1);
+        core::hint::spin_loop();
+    }
+
+    FLASH_PARK_ACK.store(false, Ordering::Release);
+}
+
 /// Core 1's minimal, peripheral-free platform.
 struct Core1Platform {
     scheduler: &'static components::sched::cooperative::CooperativeComponentType,
@@ -472,6 +556,17 @@ pub unsafe extern "C" fn core1_entry() -> ! {
     // for the leader's descriptor rather than assuming "not here yet" means
     // "never coming."
     loop {
+        // Stage 2 flash-write benchmark: if core 0 has requested a park
+        // (about to pause XIP chip-wide for a real flash op), stop running
+        // any flash-resident code -- including the rest of this loop body --
+        // and spin entirely from RAM until released. See
+        // `core1_flash_park_loop`'s doc comment.
+        if FLASH_PARK_REQUEST.load(core::sync::atomic::Ordering::Acquire) {
+            // SAFETY: called only here, only from core 1.
+            unsafe { core1_flash_park_loop() };
+            continue;
+        }
+
         round += 1;
         CORE1_ROUND.store(round, core::sync::atomic::Ordering::Relaxed);
 
@@ -836,6 +931,160 @@ pub unsafe fn main() {
     // matching call.
     lockstep_barrier(&RP2350_TRANSPORT, SyncEntry::Sync { fingerprint: 0 }, |_| {});
     kernel::debug!("Lockstep: init sync complete");
+
+    // Stage 2a (flash-write benchmark plan): boot-ROM function lookup only
+    // -- no flash access, no XIP pause, nothing RAM-resident yet. Verifies
+    // the lookup mechanism and offsets before Stage 2b/2c build on top of
+    // it. Safe to run from ordinary flash-resident code. Placed after the
+    // boot handshake above (not before, as in the first attempt) since core
+    // 1 spin-waits inside its own half of that handshake until core 0
+    // reaches it -- anything placed earlier tests against a core 1 that
+    // hasn't reached its main loop yet.
+    // SAFETY: reads a fixed, always-mapped ROM byte; does not touch flash.
+    let rom_version = unsafe { rp2350::flash::rom_version() };
+    let flash_rom_fns = unsafe { rp2350::flash::FlashRomFns::lookup() };
+    kernel::debug!(
+        "flash rom lookup: rom_version={} IF={:#010x} EX={:#010x} RE={:#010x} RP={:#010x} FC={:#010x} CX={:#010x} ok={}",
+        rom_version,
+        flash_rom_fns.connect_internal_flash as usize,
+        flash_rom_fns.flash_exit_xip as usize,
+        flash_rom_fns.flash_range_erase as usize,
+        flash_rom_fns.flash_range_program as usize,
+        flash_rom_fns.flash_flush_cache as usize,
+        flash_rom_fns.flash_enter_cmd_xip as usize,
+        flash_rom_fns.all_resolved_and_distinct(),
+    );
+
+    // Stage 2b (flash-write benchmark plan): core-1 parking handshake,
+    // still no flash touched -- the loop below stands in for where Stage
+    // 2c's real flash_range_erase/program call will go. Confirms core 1
+    // genuinely stops its normal loop while parked and genuinely resumes
+    // afterward, before Stage 2c trusts this handshake around a real XIP
+    // pause.
+    {
+        use core::sync::atomic::Ordering;
+
+        // Wait for core 1 to reach its steady-state loop before testing the
+        // handshake against it.
+        let mut wait_iters: u32 = 0;
+        while CORE1_STAGE.load(Ordering::Acquire) != 3 && wait_iters < 5_000_000 {
+            wait_iters += 1;
+            core::hint::spin_loop();
+        }
+
+        FLASH_PARK_REQUEST.store(true, Ordering::Release);
+        let mut ack_wait: u32 = 0;
+        while !FLASH_PARK_ACK.load(Ordering::Acquire) && ack_wait < 5_000_000 {
+            ack_wait += 1;
+            core::hint::spin_loop();
+        }
+        let acked = FLASH_PARK_ACK.load(Ordering::Acquire);
+
+        let round_before_park = CORE1_ROUND.load(Ordering::Relaxed);
+        // Nothing here touches flash; this stands in for Stage 2c's real
+        // flash op.
+        for _ in 0..200_000 {
+            core::hint::spin_loop();
+        }
+        let round_during_park = CORE1_ROUND.load(Ordering::Relaxed);
+
+        FLASH_PARK_REQUEST.store(false, Ordering::Release);
+        let mut release_wait: u32 = 0;
+        while FLASH_PARK_ACK.load(Ordering::Acquire) && release_wait < 5_000_000 {
+            release_wait += 1;
+            core::hint::spin_loop();
+        }
+        let released = !FLASH_PARK_ACK.load(Ordering::Acquire);
+
+        // Confirm core 1 actually resumed its normal loop (not just cleared
+        // the ack flag) by checking its round counter advances again.
+        let mut resume_wait: u32 = 0;
+        while CORE1_ROUND.load(Ordering::Relaxed) <= round_during_park && resume_wait < 5_000_000
+        {
+            resume_wait += 1;
+            core::hint::spin_loop();
+        }
+        let resumed = CORE1_ROUND.load(Ordering::Relaxed) > round_during_park;
+
+        kernel::debug!(
+            "flash park test: acked={} round_before_park={} round_during_park={} released={} resumed={}",
+            acked, round_before_park, round_during_park, released, resumed,
+        );
+    }
+
+    // Stage 2c (flash-write benchmark plan): real erase + program on a
+    // fixed scratch sector, orchestrated around the park handshake Stage 2b
+    // validated. FLASH_SCRATCH_OFFSET (absolute 0x10200000) is >1MB past
+    // the app region (`prog`, ends ~0x10080000 per layout.ld) and 1.75MB
+    // clear of the top of the 4MB chip -- a bug here can't reach the kernel
+    // or app image.
+    {
+        use core::sync::atomic::Ordering;
+
+        const FLASH_SCRATCH_OFFSET: u32 = 0x0020_0000;
+        const FLASH_SCRATCH_ADDR: usize = 0x1000_0000 + FLASH_SCRATCH_OFFSET as usize;
+
+        rp2350::flash::init_boot2_ram_copy();
+
+        FLASH_PARK_REQUEST.store(true, Ordering::Release);
+        let mut ack_wait: u32 = 0;
+        while !FLASH_PARK_ACK.load(Ordering::Acquire) && ack_wait < 5_000_000 {
+            ack_wait += 1;
+            core::hint::spin_loop();
+        }
+        let parked = FLASH_PARK_ACK.load(Ordering::Acquire);
+
+        let mut erase_ok = false;
+        let mut program_ok = false;
+
+        if parked {
+            // SAFETY: rom_fns resolved successfully (Stage 2a, ok=true);
+            // core 1 confirmed parked above; offset is sector-aligned and
+            // within the scratch region reserved for this benchmark.
+            unsafe {
+                rp2350::flash::erase_sector_from_ram(&flash_rom_fns, FLASH_SCRATCH_OFFSET)
+            };
+
+            // An erased NOR sector reads back as all-0xFF.
+            erase_ok = (0..16).all(|i| {
+                // SAFETY: within the freshly-erased scratch sector; XIP was
+                // restored before erase_sector_from_ram returned.
+                let byte =
+                    unsafe { core::ptr::read_volatile((FLASH_SCRATCH_ADDR + i) as *const u8) };
+                byte == 0xFF
+            });
+
+            let mut pattern = [0u8; rp2350::flash::FLASH_PAGE_SIZE];
+            for (i, b) in pattern.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            // SAFETY: pattern is a RAM-resident local array; offset lies
+            // within the sector just erased above.
+            unsafe {
+                rp2350::flash::program_from_ram(&flash_rom_fns, FLASH_SCRATCH_OFFSET, &pattern)
+            };
+            program_ok = (0..pattern.len()).all(|i| {
+                // SAFETY: within the scratch sector just programmed; XIP
+                // was restored before program_from_ram returned.
+                let byte =
+                    unsafe { core::ptr::read_volatile((FLASH_SCRATCH_ADDR + i) as *const u8) };
+                byte == pattern[i]
+            });
+        }
+
+        FLASH_PARK_REQUEST.store(false, Ordering::Release);
+        let mut release_wait: u32 = 0;
+        while FLASH_PARK_ACK.load(Ordering::Acquire) && release_wait < 5_000_000 {
+            release_wait += 1;
+            core::hint::spin_loop();
+        }
+        let released = !FLASH_PARK_ACK.load(Ordering::Acquire);
+
+        kernel::debug!(
+            "flash write test: parked={} erase_ok={} program_ok={} released={}",
+            parked, erase_ok, program_ok, released,
+        );
+    }
 
     // Drain any interrupts/deferred calls left over from peripheral
     // initialization (UART, GPIO, alarm mux setup) to avoid a spurious
