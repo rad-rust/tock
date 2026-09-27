@@ -23,9 +23,8 @@
 //! buffer, following the exact same pattern as the QEMU port's
 //! `UART_RX_REPLAY_BUF`.
 
-use core::cell::UnsafeCell;
+use core::sync::atomic::{fence, AtomicU32, Ordering};
 
-use cortexm33::support::dmb;
 use kernel::collections::spsc_channel::BiChannel;
 
 use crate::chip::Processor;
@@ -60,17 +59,13 @@ pub const UART_RX_REPLAY_MAX: usize = 256;
 /// notification ("data's ready"), with the bulk payload passed via ordinary
 /// shared memory. `LOCKSTEP_CHAN`'s `UartRxReady { len }` message is that
 /// notification; this buffer is the payload it points at.
-pub struct UartRxReplayBuf(pub UnsafeCell<[u8; UART_RX_REPLAY_MAX]>);
-
-// SAFETY: only core 0 writes the buffer (in receive()), and only before
-// pushing UartRxReady onto LOCKSTEP_CHAN. Core 1 reads it only after popping
-// that message. The channel's own push/pop ordering (Release before
-// advancing the tail index, Acquire on read) provides the happens-before
-// relationship that makes this raw shared-memory access sound.
-unsafe impl Sync for UartRxReplayBuf {}
-
-pub static UART_RX_REPLAY_BUF: UartRxReplayBuf =
-    UartRxReplayBuf(UnsafeCell::new([0u8; UART_RX_REPLAY_MAX]));
+///
+/// Relaxed atomics suffice: core 0 writes before pushing `UartRxReady`, and
+/// core 1 reads after popping it, so the channel's Release/Acquire ordering
+/// makes the bytes visible. Bytes are packed little-endian into words so the
+/// copy is word-wide.
+static UART_RX_REPLAY_BUF: [AtomicU32; UART_RX_REPLAY_MAX / 4] =
+    [const { AtomicU32::new(0) }; UART_RX_REPLAY_MAX / 4];
 
 // ---------------------------------------------------------------------------
 // Rp2350Transport — Transport impl for SIO FIFO + BiChannel
@@ -112,9 +107,10 @@ impl Transport for Rp2350Transport {
             // Doorbell: the FIFO word's value carries no meaning of its own
             // -- the payload already landed in LOCKSTEP_CHAN above, ordered
             // by its internal Release fence. This write just raises
-            // SIO_IRQ_FIFO on the peer. `dmb` ensures the channel write is
-            // visible before the peer observes the FIFO word.
-            unsafe { dmb() };
+            // SIO_IRQ_FIFO on the peer. The fence (a `dmb`) ensures the
+            // channel write is visible before the peer observes the FIFO
+            // word, so a peer woken from `wfi` never finds the channel empty.
+            fence(Ordering::SeqCst);
             let _ = SIO::new().fifo_try_push(0);
         }
         pushed
@@ -140,10 +136,19 @@ impl Transport for Rp2350Transport {
     fn bulk_write(&self, tag: BulkTag, bytes: &[u8]) {
         match tag {
             BulkTag::UartRx => {
-                let copy_len = bytes.len().min(UART_RX_REPLAY_MAX);
-                unsafe {
-                    (&mut *UART_RX_REPLAY_BUF.0.get())[..copy_len]
-                        .copy_from_slice(&bytes[..copy_len]);
+                let (words, tail) = bytes.as_chunks::<4>();
+                for (slot, word) in UART_RX_REPLAY_BUF.iter().zip(words) {
+                    slot.store(u32::from_le_bytes(*word), Ordering::Relaxed);
+                }
+
+                // Copy last <4 bits if it exists
+                if let Some(slot) = UART_RX_REPLAY_BUF
+                    .get(words.len())
+                    .filter(|_| !tail.is_empty())
+                {
+                    let mut word = [0u8; 4];
+                    word[..tail.len()].copy_from_slice(tail);
+                    slot.store(u32::from_le_bytes(word), Ordering::Relaxed);
                 }
             }
         }
@@ -153,8 +158,17 @@ impl Transport for Rp2350Transport {
         match tag {
             BulkTag::UartRx => {
                 let len = out.len().min(UART_RX_REPLAY_MAX);
-                unsafe {
-                    out[..len].copy_from_slice(&(&*UART_RX_REPLAY_BUF.0.get())[..len]);
+                let (words, tail) = out[..len].as_chunks_mut::<4>();
+                for (word, slot) in words.iter_mut().zip(&UART_RX_REPLAY_BUF) {
+                    *word = slot.load(Ordering::Relaxed).to_le_bytes();
+                }
+
+                // Copy last <4 bits if it exists
+                if let Some(slot) = UART_RX_REPLAY_BUF
+                    .get(words.len())
+                    .filter(|_| !tail.is_empty())
+                {
+                    tail.copy_from_slice(&slot.load(Ordering::Relaxed).to_le_bytes()[..tail.len()]);
                 }
                 len
             }

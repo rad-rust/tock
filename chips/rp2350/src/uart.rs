@@ -876,7 +876,7 @@ pub fn replay_pending_tx_done_for_core1() {
 /// capsule.
 ///
 /// Core 0 owns the physical UART. Core 1 receives data via the lockstep
-/// replay path: core 0 copies received bytes into `UART_RX_REPLAY_BUF`,
+/// replay path: core 0 copies received bytes into the lockstep replay buffer,
 /// pushes `SyncEntry::UartRxReady` (which implicitly kicks core 1 via the
 /// real SIO FIFO doorbell), and core 1's main loop dispatches that to
 /// `replay_rx_done_for_core1()`, which delivers the bytes to the waiting app
@@ -913,11 +913,10 @@ impl Rp2350UartReplay {
             None => return,
         };
         let len = len as usize;
-        use crate::lockstep::{UART_RX_REPLAY_BUF, UART_RX_REPLAY_MAX};
-        let copy_len = len.min(UART_RX_REPLAY_MAX).min(rx_buffer.len());
-        unsafe {
-            rx_buffer[..copy_len].copy_from_slice(&(&*UART_RX_REPLAY_BUF.0.get())[..copy_len]);
-        }
+        use crate::lockstep::{BulkTag, Transport};
+        let copy_len = len.min(rx_buffer.len());
+        let copy_len = crate::lockstep::RP2350_TRANSPORT
+            .bulk_read(BulkTag::UartRx, &mut rx_buffer[..copy_len]);
         self.rx_client.map(move |client| {
             client.received_buffer(rx_buffer, copy_len, Ok(()), hil::uart::Error::None)
         });
